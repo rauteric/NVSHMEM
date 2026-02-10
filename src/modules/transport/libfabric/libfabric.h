@@ -119,6 +119,13 @@ struct nvshmemt_libfabric_endpoint_seq_counter_t {
     uint32_t pending_acks[num_categories];
 
     /**
+     * Default constructor - initializes counter to zero
+     */
+    nvshmemt_libfabric_endpoint_seq_counter_t() {
+        reset();
+    }
+
+    /**
      * Reset counter and pending acks to zero
      */
     void reset() {
@@ -190,9 +197,10 @@ typedef struct {
     struct fid_cntr *counter;
     uint64_t submitted_ops;
     uint64_t completed_staged_atomics;
-    nvshmemt_libfabric_endpoint_seq_counter_t put_signal_seq_counter;
+    std::unordered_map<fi_addr_t, nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
     std::unordered_map<uint64_t, std::pair<nvshmemt_libfabric_gdr_op_ctx_t *, int>>
         *proxy_put_signal_comp_map;
+    std::unordered_map<fi_addr_t, uint32_t> *next_expected_seq;
     int domain_index;
 } nvshmemt_libfabric_endpoint_t;
 

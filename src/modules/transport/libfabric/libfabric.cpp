@@ -124,11 +124,12 @@ static inline nvshmemt_libfabric_endpoint_t *nvshmemt_libfabric_get_next_ep(
 }
 
 static void nvshmemt_libfabric_put_signal_ack_completion(nvshmemt_libfabric_endpoint_t *ep,
-                                                         struct fi_cq_data_entry *entry) {
+                                                         struct fi_cq_data_entry *entry,
+                                                         fi_addr_t addr) {
     uint32_t seq_num = entry->data & NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_MASK;
 
     if (seq_num != NVSHMEM_STAGED_AMO_SEQ_NUM) {
-        ep->put_signal_seq_counter.return_acked_seq_num(seq_num);
+        (*ep->put_signal_seq_counter_per_pe)[addr].return_acked_seq_num(seq_num);
     }
 
     ep->completed_staged_atomics++;
@@ -150,7 +151,7 @@ static int nvshmemt_libfabric_gdr_process_completion(nvshmem_transport_t transpo
             status = nvshmemt_libfabric_put_signal_completion(transport, ep, entry, addr);
             goto out;
         } else if (NVSHMEMT_LIBFABRIC_IMM_STAGED_ATOMIC_ACK == imm_header) {
-            nvshmemt_libfabric_put_signal_ack_completion(ep, entry);
+            nvshmemt_libfabric_put_signal_ack_completion(ep, entry, *addr);
             goto out;
         } else {
             NVSHMEMI_ERROR_JMP(status, NVSHMEMX_ERROR_INVALID_VALUE, out,
@@ -733,8 +734,28 @@ int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transport,
             op = iter->second.first;
         }
 
-        libfabric_state->op_queue[ep->domain_index]->putToRecv(op, NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK);
-        ep->proxy_put_signal_comp_map->erase(iter);
+        // This operation is now ready - try to drain in sequence order
+        fi_addr_t src_addr = *addr;
+        // operator[] will default-construct (initialize to 0) if src_addr doesn't exist
+        uint32_t &next_seq = (*ep->next_expected_seq)[src_addr];
+
+        while (true) {
+            // Skip reserved sequence number
+            if (next_seq == NVSHMEM_STAGED_AMO_SEQ_NUM) {
+                next_seq = (next_seq + 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
+                continue;
+            }
+
+            uint64_t key = (uint64_t)src_addr << 32 | next_seq;
+            auto it = ep->proxy_put_signal_comp_map->find(key);
+
+            // Stop if: operation doesn't exist OR operation not ready (progress_count != 0)
+            if (it == ep->proxy_put_signal_comp_map->end() || it->second.second != 0) break;
+
+            libfabric_state->op_queue[ep->domain_index]->putToRecv(it->second.first, NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK);
+            ep->proxy_put_signal_comp_map->erase(it);
+            next_seq = (next_seq + 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
+        }
     }
 
 out:
@@ -1198,10 +1219,15 @@ int nvshmemt_put_signal_unordered(struct nvshmem_transport *tcurr, int pe, rma_v
     uint32_t sequence_count = 0;
     nvshmemt_libfabric_endpoint_t *ep = nvshmemt_libfabric_get_next_ep(state, qp_index);
 
+    int target_ep = pe * state->num_selected_domains + ep->domain_index;
+
+    /* Get or create sequence counter for this destination fi_addr_t */
+    auto &seq_counter = (*ep->put_signal_seq_counter_per_pe)[target_ep];
+
     /* Get sequence number for this put-signal, with retry */
     uint64_t num_retries = 0;
     do {
-        int32_t seq_num = ep->put_signal_seq_counter.next_seq_num();
+        int32_t seq_num = seq_counter.next_seq_num();
         if (seq_num < 0) {
             status = -EAGAIN;
         } else {
@@ -1664,7 +1690,11 @@ static int nvshmemt_libfabric_connect_endpoints(nvshmem_transport_t t, int *sele
         state->eps[i]->proxy_put_signal_comp_map =
             new std::unordered_map<uint64_t, std::pair<nvshmemt_libfabric_gdr_op_ctx_t *, int>>();
 
-        state->eps[i]->put_signal_seq_counter.reset();
+        state->eps[i]->next_expected_seq = new std::unordered_map<fi_addr_t, uint32_t>();
+
+        state->eps[i]->put_signal_seq_counter_per_pe =
+            new std::unordered_map<fi_addr_t, nvshmemt_libfabric_endpoint_seq_counter_t>();
+
         state->eps[i]->completed_staged_atomics = 0;
 
         status = fi_cq_open(domain, &cq_attr, &state->eps[i]->cq, NULL);
@@ -1681,6 +1711,7 @@ static int nvshmemt_libfabric_connect_endpoints(nvshmem_transport_t t, int *sele
         NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
                               "Unable to allocate endpoint: %d: %s\n", status,
                               fi_strerror(status * -1));
+
         /* FI_OPT_CUDA_API_PERMITTED was introduced in libfabric 1.18.0 */
         if (state->provider == NVSHMEMT_LIBFABRIC_PROVIDER_EFA) {
             bool prohibit_cuda_api = false;
@@ -1827,6 +1858,10 @@ out:
         for (size_t i = 0; i < state->eps.size(); i++) {
             if (state->eps[i]->proxy_put_signal_comp_map)
                 delete state->eps[i]->proxy_put_signal_comp_map;
+            if (state->eps[i]->next_expected_seq)
+                delete state->eps[i]->next_expected_seq;
+            if (state->eps[i]->put_signal_seq_counter_per_pe)
+                delete state->eps[i]->put_signal_seq_counter_per_pe;
             if (state->eps[i]->endpoint) {
                 fi_close(&state->eps[i]->endpoint->fid);
                 state->eps[i]->endpoint = NULL;
@@ -1897,6 +1932,10 @@ static int nvshmemt_libfabric_finalize(nvshmem_transport_t transport) {
     for (size_t i = 0; i < state->eps.size(); i++) {
         if (state->eps[i]->proxy_put_signal_comp_map)
             delete state->eps[i]->proxy_put_signal_comp_map;
+        if (state->eps[i]->next_expected_seq)
+            delete state->eps[i]->next_expected_seq;
+        if (state->eps[i]->put_signal_seq_counter_per_pe)
+            delete state->eps[i]->put_signal_seq_counter_per_pe;
         if (state->eps[i]->endpoint) {
             status = fi_close(&state->eps[i]->endpoint->fid);
             if (status) {
