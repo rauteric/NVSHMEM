@@ -111,6 +111,11 @@ static void nvshmemt_libfabric_put_signal_ack_completion(nvshmemt_libfabric_endp
     ep->completed_staged_atomics++;
 }
 
+static inline bool is_signal_only_op(nvshmemi_amo_t op) {
+    return (op == NVSHMEMI_AMO_SIGNAL || op == NVSHMEMI_AMO_SIGNAL_SET ||
+            op == NVSHMEMI_AMO_SIGNAL_ADD);
+}
+
 static int nvshmemt_libfabric_gdr_process_completion(nvshmem_transport_t transport,
                                                      nvshmemt_libfabric_endpoint_t *ep,
                                                      struct fi_cq_data_entry *entry,
@@ -285,6 +290,25 @@ static inline int try_again(nvshmem_transport_t transport, int *status, uint64_t
     }
 
     return 1;
+}
+
+static inline int get_next_seq_num_with_retry(nvshmem_transport_t transport,
+                                               nvshmemt_libfabric_endpoint_seq_counter_t &seq_counter,
+                                               uint32_t *sequence_count,
+                                               nvshmemt_libfabric_try_again_call_site_t call_site) {
+    uint64_t num_retries = 0;
+    int status;
+    do {
+        int32_t seq_num = seq_counter.next_seq_num();
+        if (seq_num < 0) {
+            status = -EAGAIN;
+        } else {
+            *sequence_count = seq_num;
+            status = 0;
+        }
+    } while (try_again(transport, &status, &num_retries, call_site));
+
+    return status;
 }
 
 int gdrcopy_amo_ack(nvshmem_transport_t transport, nvshmemt_libfabric_endpoint_t *ep,
@@ -849,12 +873,16 @@ static int nvshmemt_libfabric_rma(struct nvshmem_transport *tcurr, int pe, rma_v
     return nvshmemt_libfabric_rma_impl(tcurr, pe, verb, remote, local, bytesdesc, is_proxy, NULL);
 }
 
+static int nvshmemt_libfabric_gdr_signal(struct nvshmem_transport *transport, int pe,
+                                         void *curetptr, amo_verb_t verb, amo_memdesc_t *remote,
+                                         amo_bytesdesc_t bytesdesc, int is_proxy,
+                                         uint32_t sequence_count, uint16_t num_writes);
+
 static int nvshmemt_libfabric_gdr_amo(struct nvshmem_transport *transport, int pe, void *curetptr,
                                       amo_verb_t verb, amo_memdesc_t *remote,
                                       amo_bytesdesc_t bytesdesc, int is_proxy) {
     nvshmemt_libfabric_state_t *libfabric_state = (nvshmemt_libfabric_state_t *)transport->state;
     nvshmemt_libfabric_endpoint_t *ep;
-    nvshmemt_libfabric_gdr_op_ctx_t *amo;
     uint64_t num_retries = 0;
     int target_ep, ep_idx;
     int status = 0;
@@ -868,6 +896,21 @@ static int nvshmemt_libfabric_gdr_amo(struct nvshmem_transport *transport, int p
     ep = &libfabric_state->eps[ep_idx];
     target_ep = pe * NVSHMEMT_LIBFABRIC_DEFAULT_NUM_EPS + ep_idx;
 
+    /* Signal-only operations use gdr_signal path with num_writes=0 */
+    if (is_signal_only_op(verb.desc)) {
+        auto &seq_counter = (*ep->put_signal_seq_counter_per_pe)[target_ep];
+        uint32_t sequence_count;
+        status = get_next_seq_num_with_retry(transport, seq_counter, &sequence_count,
+                                             NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_GDR_AMO_GET_NEXT_SENDS);
+        if (status) goto out;
+
+        status = nvshmemt_libfabric_gdr_signal(transport, pe, curetptr, verb, remote,
+                                               bytesdesc, is_proxy, sequence_count, 0);
+        goto out;
+    }
+
+    /* Fetch operations use full gdr_op_ctx_t */
+    nvshmemt_libfabric_gdr_op_ctx_t *amo;
     do {
         status = nvshmemtLibfabricOpQueue.getNextSends((void **)(&amo), 1);
     } while (try_again(transport, &status, &num_retries,
@@ -882,8 +925,8 @@ static int nvshmemt_libfabric_gdr_amo(struct nvshmem_transport *transport, int p
     amo->send_amo.swap_add = remote->val;
     amo->send_amo.size = bytesdesc.elembytes;
     amo->send_amo.src_pe = transport->my_pe;
-    amo->type = NVSHMEMT_LIBFABRIC_SEND;
     amo->send_amo.comp = remote->cmp;
+    amo->type = NVSHMEMT_LIBFABRIC_SEND;
 
     num_retries = 0;
     do {
@@ -1137,18 +1180,8 @@ int nvshmemt_put_signal_unordered(struct nvshmem_transport *tcurr, int pe, rma_v
     auto &seq_counter = (*ep.put_signal_seq_counter_per_pe)[target_ep];
 
     /* Get sequence number for this put-signal, with retry */
-    uint64_t num_retries = 0;
-    do {
-        int32_t seq_num = seq_counter.next_seq_num();
-        if (seq_num < 0) {
-            status = -EAGAIN;
-        } else {
-            sequence_count = seq_num;
-            status = 0;
-        }
-    } while (try_again(tcurr, &status, &num_retries,
-                       NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_PUT_SIGNAL_UNORDERED_SEQ));
-
+    status = get_next_seq_num_with_retry(tcurr, seq_counter, &sequence_count,
+                                         NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_PUT_SIGNAL_UNORDERED_SEQ);
     if (unlikely(status)) {
         NVSHMEMI_ERROR_PRINT("Error in nvshmemt_put_signal_unordered while waiting for category\n");
         goto out;
