@@ -254,6 +254,7 @@ typedef enum {
 typedef enum {
     NVSHMEMT_LIBFABRIC_IMM_PUT_SIGNAL_SEQ = 0,
     NVSHMEMT_LIBFABRIC_IMM_STAGED_ATOMIC_ACK,
+    NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT,
 } nvshmemt_libfabric_imm_cq_data_hdr_t;
 
 class threadSafeOpQueue {

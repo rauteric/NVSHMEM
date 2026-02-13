@@ -152,7 +152,8 @@ static int nvshmemt_libfabric_gdr_process_completion(nvshmem_transport_t transpo
     if (entry->flags & FI_REMOTE_CQ_DATA) {
         nvshmemt_libfabric_imm_cq_data_hdr_t imm_header =
             nvshmemt_get_write_with_imm_hdr(entry->data);
-        if (NVSHMEMT_LIBFABRIC_IMM_PUT_SIGNAL_SEQ == imm_header) {
+        if (NVSHMEMT_LIBFABRIC_IMM_PUT_SIGNAL_SEQ == imm_header ||
+            NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT == imm_header) {
             status = nvshmemt_libfabric_put_signal_completion(transport, ep, entry, addr);
             goto out;
         } else if (NVSHMEMT_LIBFABRIC_IMM_STAGED_ATOMIC_ACK == imm_header) {
@@ -175,7 +176,7 @@ static int nvshmemt_libfabric_gdr_process_completion(nvshmem_transport_t transpo
     } else if (entry->flags & FI_RMA) {
         /* inlined p ops or atomic responses */
         state->op_queue[ep->domain_index]->putToSend(op);
-    } else if (op->type == NVSHMEMT_LIBFABRIC_MATCH) {
+    } else if ((op->type == NVSHMEMT_LIBFABRIC_MATCH) && (entry->flags & FI_RECV)) {
         /* Must happen after entry->flags & FI_SEND to avoid send completions */
         status = nvshmemt_libfabric_put_signal_completion(transport, ep, entry, addr);
     } else if (entry->flags & FI_RECV) {
@@ -717,6 +718,7 @@ int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transport,
     bool is_write_comp = entry->flags & FI_REMOTE_CQ_DATA;
     int status = 0, progress_count;
     uint64_t map_key;
+    bool is_standalone_put = false;
     std::unordered_map<uint64_t, std::pair<nvshmemt_libfabric_gdr_op_ctx_t *, int>>::iterator iter;
 
     if (unlikely(*addr == FI_ADDR_NOTAVAIL)) {
@@ -726,7 +728,10 @@ int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transport,
     }
 
     if (is_write_comp) {
-        map_key = *addr << 32 | (uint32_t)entry->data;
+        nvshmemt_libfabric_imm_cq_data_hdr_t imm_header =
+            nvshmemt_get_write_with_imm_hdr(entry->data);
+        is_standalone_put = (imm_header == NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT);
+        map_key = *addr << 32 | ((uint32_t)entry->data & NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_MASK);
         progress_count = -1;
     } else {
         sig_op = (nvshmemt_libfabric_gdr_signal_op *)container_of(
@@ -746,16 +751,20 @@ int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transport,
 
     iter = ep->proxy_put_signal_comp_map->find(map_key);
     if (iter != ep->proxy_put_signal_comp_map->end()) {
+        // Entry exists - update it
         if (!is_write_comp) iter->second.first = op;
         iter->second.second += progress_count;
     } else {
+        // New entry - determine initial progress_count
+        int initial_progress = is_standalone_put ? 0 : progress_count;
         iter = ep->proxy_put_signal_comp_map
-                   ->insert(std::make_pair(map_key, std::make_pair(op, progress_count)))
+                   ->insert(std::make_pair(map_key, std::make_pair(op, initial_progress)))
                    .first;
     }
 
     if (!iter->second.second) {
-        if (is_write_comp) {
+        // Operation is ready - get the op pointer if this was a write completion
+        if (is_write_comp && iter->second.first != NULL) {
             op = iter->second.first;
         }
 
@@ -777,7 +786,10 @@ int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transport,
             // Stop if: operation doesn't exist OR operation not ready (progress_count != 0)
             if (it == ep->proxy_put_signal_comp_map->end() || it->second.second != 0) break;
 
-            libfabric_state->op_queue[ep->domain_index]->putToRecv(it->second.first, NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK);
+            // Only drain signal operations (non-NULL op pointer)
+            if (it->second.first != NULL) {
+                libfabric_state->op_queue[ep->domain_index]->putToRecv(it->second.first, NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK);
+            }
             ep->proxy_put_signal_comp_map->erase(it);
             next_seq = (next_seq + 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
         }
@@ -893,16 +905,22 @@ static int nvshmemt_libfabric_rma_impl(struct nvshmem_transport *tcurr, int pe, 
     op_size = bytesdesc.elembytes * bytesdesc.nelems;
 
     if (verb.desc == NVSHMEMI_OP_P) {
-        assert(!imm_data);  // Write w/ imm not suppored with NVSHMEMI_OP_P on Libfabric transport
         if (libfabric_state->provider == NVSHMEMT_LIBFABRIC_PROVIDER_EFA) {
             nvshmemt_libfabric_gdr_op_ctx_t *p_buf =
                 container_of(context, nvshmemt_libfabric_gdr_op_ctx_t, ofi_context);
             num_retries = 0;
+            p_buf->p_op.value = *(uint64_t *)local->ptr;
             do {
-                p_buf->p_op.value = *(uint64_t *)local->ptr;
-                status = fi_write(ep->endpoint, &p_buf->p_op.value, op_size,
-                                  fi_mr_desc(libfabric_state->mr[ep->domain_index]), target_ep,
-                                  (uintptr_t)remote->ptr, remote_handle->key, context);
+                if (imm_data) {
+                    status = fi_writedata(ep->endpoint, &p_buf->p_op.value, op_size,
+                                          fi_mr_desc(libfabric_state->mr[ep->domain_index]), *imm_data, target_ep,
+                                          (uintptr_t)remote->ptr, remote_handle->key, context);
+                } else {
+                    abort();
+                    status = fi_write(ep->endpoint, &p_buf->p_op.value, op_size,
+                                      fi_mr_desc(libfabric_state->mr[ep->domain_index]), target_ep,
+                                      (uintptr_t)remote->ptr, remote_handle->key, context);
+                }
             } while (try_again(tcurr, &status, &num_retries, qp_index,
                                NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_RMA_IMPL_OP_P_EFA));
         } else {
@@ -982,8 +1000,30 @@ out:
 static int nvshmemt_libfabric_rma(struct nvshmem_transport *tcurr, int pe, rma_verb_t verb,
                                   rma_memdesc_t *remote, rma_memdesc_t *local,
                                   rma_bytesdesc_t bytesdesc, int qp_index) {
-    return nvshmemt_libfabric_rma_impl(tcurr, pe, verb, remote, local, bytesdesc, qp_index, NULL,
-                                       NULL);
+    nvshmemt_libfabric_state_t *libfabric_state = (nvshmemt_libfabric_state_t *)tcurr->state;
+    uint32_t imm_data_val = 0;
+    uint32_t *imm_data = NULL;
+    int status;
+    nvshmemt_libfabric_endpoint_t *ep = nullptr;
+
+    // Generate sequence number for P and PUT operations when ordering is needed
+    if (use_staged_atomics &&
+        (verb.desc == NVSHMEMI_OP_P || verb.desc == NVSHMEMI_OP_PUT)) {
+        ep = nvshmemt_libfabric_get_next_ep(libfabric_state, qp_index);
+        int target_ep = pe * libfabric_state->num_selected_domains + ep->domain_index;
+        auto &seq_counter = (*ep->put_signal_seq_counter_per_pe)[target_ep];
+        uint32_t sequence_count;
+
+        status = get_next_seq_num_with_retry(tcurr, seq_counter, &sequence_count, qp_index,
+                                             NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_RMA_IMPL_OP_PUT);
+        if (status) return status;
+
+        imm_data_val = (NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT << NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_SHIFT) | sequence_count;
+        imm_data = &imm_data_val;
+    }
+
+    return nvshmemt_libfabric_rma_impl(tcurr, pe, verb, remote, local, bytesdesc, qp_index, imm_data,
+                                       ep);
 }
 
 static int nvshmemt_libfabric_gdr_signal(struct nvshmem_transport *transport, int pe,
