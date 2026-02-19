@@ -197,10 +197,6 @@ typedef struct {
     struct fid_cntr *counter;
     uint64_t submitted_ops;
     uint64_t completed_staged_atomics;
-    std::unordered_map<fi_addr_t, nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
-    std::unordered_map<uint64_t, std::pair<nvshmemt_libfabric_gdr_op_ctx_t *, int>>
-        *proxy_put_signal_comp_map;
-    std::unordered_map<fi_addr_t, uint32_t> *next_expected_seq;
     int domain_index;
 } nvshmemt_libfabric_endpoint_t;
 
@@ -401,6 +397,12 @@ class threadSafeOpQueue {
 };
 
 typedef struct {
+    std::unordered_map<fi_addr_t, nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
+    std::unordered_map<uint64_t, std::pair<nvshmemt_libfabric_gdr_op_ctx_t *, int>> *proxy_put_signal_comp_map;
+    std::unordered_map<fi_addr_t, uint32_t> *next_expected_seq;
+} nvshmemt_libfabric_signal_state_t;
+
+typedef struct {
     struct fi_info *all_prov_info;
     std::vector<struct fi_info *> prov_infos;
     std::vector<struct fid_fabric *> fabrics;
@@ -429,6 +431,10 @@ typedef struct {
     std::vector<struct fid_mr *> mr_staged_amo_ack;
     void **remote_addr_staged_amo_ack;
     uint64_t *rkey_staged_amo_ack;
+
+    /* Signal ordering state */
+    nvshmemt_libfabric_signal_state_t host_signal_state;
+    nvshmemt_libfabric_signal_state_t proxy_signal_state;
 } nvshmemt_libfabric_state_t;
 
 typedef struct {
