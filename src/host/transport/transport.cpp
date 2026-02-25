@@ -384,7 +384,13 @@ int nvshmemi_setup_connections(nvshmemi_state_t *state) {
             continue;
         }
 
-        int devices_temp = tcurr->n_devices / state->npes_node;
+        int n_gpus_node = 0;
+        cudaError_t cuda_status = cudaGetDeviceCount(&n_gpus_node);
+        if (cuda_status != cudaSuccess || n_gpus_node <= 0) {
+            n_gpus_node = state->npes_node;
+        }
+
+        int devices_temp = tcurr->n_devices / n_gpus_node;
         if (devices_temp == 0) devices_temp = 1;
         const int max_devices_per_pe = devices_temp;
         int selected_devices[max_devices_per_pe];
