@@ -51,8 +51,6 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void sync_dissem_pow2_t
                                               counter[0], to_nbr);
         }
 
-        nvshmemi_transfer_fence<nvshmemi_threadgroup_thread>(NVSHMEMX_PE_ALL, NULL, 1);
-
         /* wait for neighbors notification */
         for (int j = myIdx + 1; j <= k - 1; j += groupSize) {
             shift = j << phase_num;
@@ -108,8 +106,6 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void sync_dissem_thread
                                               counter[0], to_nbr);
         }
 
-        nvshmemi_transfer_fence<nvshmemi_threadgroup_thread>(NVSHMEMX_PE_ALL, NULL, 1);
-
         /* wait for neighbors notification */
         for (int j = myIdx + 1; j <= k - 1; j += groupSize) {
             shift = j * pow_k;
@@ -160,8 +156,6 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void sync_dissem_thread
             nvshmemi_signal_for_barrier<long>(((long *)sync_arr + nvshmemi_device_state_d.mype),
                                               counter[0], to_nbr);
         }
-
-        nvshmemi_transfer_fence<nvshmemi_threadgroup_thread>(NVSHMEMX_PE_ALL, NULL, 1);
 
         /* wait for neighbors notification */
         for (int j = myIdx + 1; j <= k - 1; j += groupSize) {
