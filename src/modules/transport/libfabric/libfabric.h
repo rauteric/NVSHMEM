@@ -397,9 +397,9 @@ class threadSafeOpQueue {
 };
 
 typedef struct {
-    std::unordered_map<fi_addr_t, nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
+    std::unordered_map<int, nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
     std::unordered_map<uint64_t, std::pair<nvshmemt_libfabric_gdr_op_ctx_t *, int>> *proxy_put_signal_comp_map;
-    std::unordered_map<fi_addr_t, uint32_t> *next_expected_seq;
+    std::unordered_map<int, uint32_t> *next_expected_seq;
 } nvshmemt_libfabric_signal_state_t;
 
 typedef struct {

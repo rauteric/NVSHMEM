@@ -123,6 +123,22 @@ static inline nvshmemt_libfabric_endpoint_t *nvshmemt_libfabric_get_next_ep(
     return state->eps[selected_ep];
 }
 
+static inline int convert_addr_to_pe(nvshmemt_libfabric_state_t *state,
+                                     nvshmemt_libfabric_endpoint_t *ep,
+                                     fi_addr_t addr)
+{
+    // addr = pe * libfabric_state->num_selected_domains + ep->domain_index
+    // so
+    // pe = (addr - ep->domain_index) / (libfabric_state->num_selected_domains)
+    int base_ep_index = addr - ep->domain_index;
+    if (unlikely(base_ep_index % state->num_selected_domains)) {
+        NVSHMEMI_WARN_PRINT("base_ep_index is not a multiple of domains");
+        abort();
+    }
+
+    return base_ep_index / state->num_selected_domains;
+}
+
 static void nvshmemt_libfabric_put_signal_ack_completion(nvshmemt_libfabric_state_t *state,
                                                          nvshmemt_libfabric_endpoint_t *ep,
                                                          struct fi_cq_data_entry *entry,
@@ -133,7 +149,8 @@ static void nvshmemt_libfabric_put_signal_ack_completion(nvshmemt_libfabric_stat
         /* Use host_signal_state for eps[0], proxy_signal_state for eps[1+] */
         nvshmemt_libfabric_signal_state_t *signal_state =
             (ep->domain_index == 0) ? &state->host_signal_state : &state->proxy_signal_state;
-        (*signal_state->put_signal_seq_counter_per_pe)[addr].return_acked_seq_num(seq_num);
+        (*signal_state->put_signal_seq_counter_per_pe)[convert_addr_to_pe(state, ep, addr)]
+            .return_acked_seq_num(seq_num);
     }
 
     ep->completed_staged_atomics++;
@@ -720,7 +737,7 @@ int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transport,
     nvshmemt_libfabric_gdr_signal_op *sig_op = NULL;
     nvshmemt_libfabric_gdr_op_ctx_t *op = NULL;
     bool is_write_comp = entry->flags & FI_REMOTE_CQ_DATA;
-    int status = 0, progress_count;
+    int status = 0, progress_count, pe;
     uint64_t map_key;
     bool is_standalone_put = false;
     std::unordered_map<uint64_t, std::pair<nvshmemt_libfabric_gdr_op_ctx_t *, int>>::iterator iter;
@@ -736,16 +753,18 @@ int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transport,
                            "Write w/imm returned with invalid src address.\n");
     }
 
+    pe = convert_addr_to_pe(libfabric_state, ep, *addr);
+
     if (is_write_comp) {
         nvshmemt_libfabric_imm_cq_data_hdr_t imm_header =
             nvshmemt_get_write_with_imm_hdr(entry->data);
         is_standalone_put = (imm_header == NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT);
-        map_key = *addr << 32 | ((uint32_t)entry->data & NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_MASK);
+        map_key = (((uint64_t)pe) << 32) | ((uint32_t)entry->data & NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_MASK);
         progress_count = -1;
     } else {
         sig_op = (nvshmemt_libfabric_gdr_signal_op *)container_of(
             entry->op_context, nvshmemt_libfabric_gdr_op_ctx_t, ofi_context);
-        map_key = *addr << 32 | sig_op->sequence_count;
+        map_key = (((uint64_t)pe) << 32) | sig_op->sequence_count;
         progress_count = (int)sig_op->num_writes;
 
         /* The EFA provider has an inline send size of 32 bytes.
@@ -780,7 +799,7 @@ int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transport,
         // This operation is now ready - try to drain in sequence order
         fi_addr_t src_addr = *addr;
         // operator[] will default-construct (initialize to 0) if src_addr doesn't exist
-        uint32_t &next_seq = (*signal_state->next_expected_seq)[src_addr];
+        uint32_t &next_seq = (*signal_state->next_expected_seq)[pe];
 
         while (true) {
             // Skip reserved sequence number
@@ -789,7 +808,7 @@ int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transport,
                 continue;
             }
 
-            uint64_t key = (uint64_t)src_addr << 32 | next_seq;
+            uint64_t key = (((uint64_t)pe) << 32) | next_seq;
             auto it = signal_state->proxy_put_signal_comp_map->find(key);
 
             // Stop if: operation doesn't exist OR operation not ready (progress_count != 0)
@@ -797,7 +816,8 @@ int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transport,
 
             // Only drain signal operations (non-NULL op pointer)
             if (it->second.first != NULL) {
-                libfabric_state->op_queue[ep->domain_index]->putToRecv(it->second.first, NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK);
+                auto op_ep = it->second.first->ep;
+                libfabric_state->op_queue[op_ep->domain_index]->putToRecv(it->second.first, NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK);
             }
             signal_state->proxy_put_signal_comp_map->erase(it);
             next_seq = (next_seq + 1) & nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
@@ -1019,13 +1039,12 @@ static int nvshmemt_libfabric_rma(struct nvshmem_transport *tcurr, int pe, rma_v
     if (use_staged_atomics &&
         (verb.desc == NVSHMEMI_OP_P || verb.desc == NVSHMEMI_OP_PUT)) {
         ep = nvshmemt_libfabric_get_next_ep(libfabric_state, qp_index);
-        int target_ep = pe * libfabric_state->num_selected_domains + ep->domain_index;
         
         /* Use host_signal_state for qp_index 0, proxy_signal_state otherwise */
         nvshmemt_libfabric_signal_state_t *signal_state =
             (qp_index == NVSHMEMX_QP_HOST) ? &libfabric_state->host_signal_state 
                                             : &libfabric_state->proxy_signal_state;
-        auto &seq_counter = (*signal_state->put_signal_seq_counter_per_pe)[target_ep];
+        auto &seq_counter = (*signal_state->put_signal_seq_counter_per_pe)[pe];
         uint32_t sequence_count;
 
         status = get_next_seq_num_with_retry(tcurr, seq_counter, &sequence_count, qp_index,
@@ -1064,7 +1083,7 @@ static int nvshmemt_libfabric_gdr_amo(struct nvshmem_transport *transport, int p
         nvshmemt_libfabric_signal_state_t *signal_state =
             (qp_index == NVSHMEMX_QP_HOST) ? &libfabric_state->host_signal_state 
                                             : &libfabric_state->proxy_signal_state;
-        auto &seq_counter = (*signal_state->put_signal_seq_counter_per_pe)[target_ep];
+        auto &seq_counter = (*signal_state->put_signal_seq_counter_per_pe)[pe];
         uint32_t sequence_count;
         status = get_next_seq_num_with_retry(transport, seq_counter, &sequence_count, qp_index,
                                              NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_GDR_AMO_GET_NEXT_SENDS);
@@ -1322,14 +1341,12 @@ int nvshmemt_put_signal_unordered(struct nvshmem_transport *tcurr, int pe, rma_v
     uint32_t sequence_count = 0;
     nvshmemt_libfabric_endpoint_t *ep = nvshmemt_libfabric_get_next_ep(state, qp_index);
 
-    int target_ep = pe * state->num_selected_domains + ep->domain_index;
-
     /* Get or create sequence counter for this destination fi_addr_t */
     /* Use host_signal_state for qp_index 0, proxy_signal_state otherwise */
     nvshmemt_libfabric_signal_state_t *signal_state =
         (qp_index == NVSHMEMX_QP_HOST) ? &state->host_signal_state 
                                         : &state->proxy_signal_state;
-    auto &seq_counter = (*signal_state->put_signal_seq_counter_per_pe)[target_ep];
+    auto &seq_counter = (*signal_state->put_signal_seq_counter_per_pe)[pe];
 
     /* Get sequence number for this put-signal, with retry */
     status = get_next_seq_num_with_retry(tcurr, seq_counter, &sequence_count, qp_index,
@@ -1727,18 +1744,18 @@ static int nvshmemt_libfabric_connect_endpoints(nvshmem_transport_t t, int *sele
 
     /* Initialize state-level signal ordering state */
     state->host_signal_state.put_signal_seq_counter_per_pe =
-        new std::unordered_map<fi_addr_t, nvshmemt_libfabric_endpoint_seq_counter_t>();
+        new std::unordered_map<int, nvshmemt_libfabric_endpoint_seq_counter_t>();
     state->host_signal_state.proxy_put_signal_comp_map =
         new std::unordered_map<uint64_t, std::pair<nvshmemt_libfabric_gdr_op_ctx_t *, int>>();
     state->host_signal_state.next_expected_seq =
-        new std::unordered_map<fi_addr_t, uint32_t>();
+        new std::unordered_map<int, uint32_t>();
 
     state->proxy_signal_state.put_signal_seq_counter_per_pe =
-        new std::unordered_map<fi_addr_t, nvshmemt_libfabric_endpoint_seq_counter_t>();
+        new std::unordered_map<int, nvshmemt_libfabric_endpoint_seq_counter_t>();
     state->proxy_signal_state.proxy_put_signal_comp_map =
         new std::unordered_map<uint64_t, std::pair<nvshmemt_libfabric_gdr_op_ctx_t *, int>>();
     state->proxy_signal_state.next_expected_seq =
-        new std::unordered_map<fi_addr_t, uint32_t>();
+        new std::unordered_map<int, uint32_t>();
 
     /* Create Resources For Each Selected Device */
     for (size_t i = 0; i < state->prov_infos.size(); i++) {
