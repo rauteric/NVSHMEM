@@ -117,6 +117,7 @@ struct nvshmemt_libfabric_endpoint_seq_counter_t {
 
     uint32_t sequence_counter;
     uint32_t pending_acks[num_categories];
+    uint32_t put_count;
 
     /**
      * Default constructor - initializes counter to zero
@@ -131,6 +132,7 @@ struct nvshmemt_libfabric_endpoint_seq_counter_t {
     void reset() {
         sequence_counter = 0;
         memset(pending_acks, 0, sizeof(pending_acks));
+        put_count = 0;
     }
 
     /**
@@ -178,6 +180,38 @@ struct nvshmemt_libfabric_endpoint_seq_counter_t {
         assert(pending_acks[category] > 0);
         --pending_acks[category];
     }
+
+    /**
+     * Mark a range of sequence numbers as complete
+     */
+    void return_acked_seq_num_range(uint32_t start_seq, uint32_t end_seq) {
+        assert(start_seq != NVSHMEM_STAGED_AMO_SEQ_NUM);
+        assert(end_seq != NVSHMEM_STAGED_AMO_SEQ_NUM);
+
+        uint32_t start_category = get_category(start_seq);
+        uint32_t end_category = get_category(end_seq);
+
+        uint32_t num_indexes;
+        if (end_seq >= start_seq) {
+            num_indexes = end_seq - start_seq + 1;
+        } else {
+            num_indexes = (sequence_mask - start_seq + 1) + (end_seq + 1);
+        }
+
+        if (start_category == end_category) {
+            assert(pending_acks[start_category] >= num_indexes);
+            pending_acks[start_category] -= num_indexes;
+        } else {
+            uint32_t count_in_start_cat = (index_mask + 1) - get_index(start_seq);
+            uint32_t count_in_end_cat = get_index(end_seq) + 1;
+
+            assert(pending_acks[start_category] >= count_in_start_cat);
+            assert(pending_acks[end_category] >= count_in_end_cat);
+
+            pending_acks[start_category] -= count_in_start_cat;
+            pending_acks[end_category] -= count_in_end_cat;
+        }
+    }
 };
 
 typedef enum {
@@ -199,6 +233,33 @@ typedef struct {
     uint64_t completed_staged_atomics;
     int domain_index;
 } nvshmemt_libfabric_endpoint_t;
+
+// Entry types for completion map
+enum nvshmemt_libfabric_comp_entry_type {
+    NVSHMEMT_LIBFABRIC_COMP_ENTRY_SIGNAL,
+    NVSHMEMT_LIBFABRIC_COMP_ENTRY_PUT_ACK
+};
+
+// Entry for signal operations (put-signal, atomic)
+struct nvshmemt_libfabric_signal_comp_entry {
+    nvshmemt_libfabric_gdr_op_ctx_t *op;
+    int progress_count;
+};
+
+// Entry for puts that need acknowledgment
+struct nvshmemt_libfabric_put_ack_entry {
+    fi_addr_t src_addr;
+    nvshmemt_libfabric_endpoint_t *ep;
+};
+
+// Tagged union for completion entries
+struct nvshmemt_libfabric_comp_entry_t {
+    nvshmemt_libfabric_comp_entry_type type;
+    union {
+        nvshmemt_libfabric_signal_comp_entry signal_entry;
+        nvshmemt_libfabric_put_ack_entry ack_entry;
+    };
+};
 
 typedef struct nvshmemt_libfabric_gdr_send_p_op {
     uint64_t value;
@@ -251,6 +312,8 @@ typedef enum {
     NVSHMEMT_LIBFABRIC_IMM_PUT_SIGNAL_SEQ = 0,
     NVSHMEMT_LIBFABRIC_IMM_STAGED_ATOMIC_ACK,
     NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT,
+    NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_WITH_ACK_REQ,
+    NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_ACK,
 } nvshmemt_libfabric_imm_cq_data_hdr_t;
 
 class threadSafeOpQueue {
@@ -398,7 +461,7 @@ class threadSafeOpQueue {
 
 typedef struct {
     std::unordered_map<int, nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
-    std::unordered_map<uint64_t, std::pair<nvshmemt_libfabric_gdr_op_ctx_t *, int>> *proxy_put_signal_comp_map;
+    std::unordered_map<uint64_t, nvshmemt_libfabric_comp_entry_t> *proxy_put_signal_comp_map;
     std::unordered_map<int, uint32_t> *next_expected_seq;
 } nvshmemt_libfabric_signal_state_t;
 
