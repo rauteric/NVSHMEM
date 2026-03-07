@@ -117,8 +117,10 @@ int main(int argc, char *argv[]) {
 
     CUDA_CHECK(cudaMemcpyToSymbol(d_error, &h_error, sizeof(int), 0));
     for (int i = 0; i < N_RUNS; i++) {
+	fprintf(stderr, "ERDBG Starting iteration %d\n", i);
         expected_value = (float)i;
         nvshmemx_barrier_all_on_stream(stream); /* Make sure that the last loop has finished. */
+	fprintf(stderr, "ERDBG Iteration %d barrier 1\n", i);
         for (int x = 0; x < nx; ++x) {
             for (int y = 0; y < ny; ++y) {
                 for (int z = 0; z < nz; ++z) {
@@ -129,8 +131,10 @@ int main(int argc, char *argv[]) {
         }
         CUDA_CHECK(cudaMemcpyAsync(f_in_a, f_in_h, alloc_sz * sizeof(float), cudaMemcpyHostToDevice,
                                    stream));
+	fprintf(stderr, "ERDBG Iteration %d before barrier 2\n", i);
         nvshmemx_barrier_all_on_stream(stream); /* Make sure that all of the PEs have finished
                                                    copying before starting the lap. */
+	fprintf(stderr, "ERDBG Iteration %d after barrier 2\n", i);
         if (use_cubin) {
             TEST_NVSHMEM_LAP_CUBIN();
         } else {
@@ -138,7 +142,9 @@ int main(int argc, char *argv[]) {
                                                       alloc_sz, expected_value);
         }
         CUDA_CHECK(cudaGetLastError());
+	fprintf(stderr, "ERDBG Iteration %d before sync\n", i);
         CUDA_CHECK(cudaDeviceSynchronize());
+	fprintf(stderr, "ERDBG Iteration %d after sync\n", i);
         CUDA_CHECK(cudaMemcpyFromSymbol(&h_error, d_error, sizeof(int), 0));
         if (h_error != 0) {
             break;
