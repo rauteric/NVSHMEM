@@ -196,6 +196,7 @@ typedef struct {
     struct fid_cq *cq;
     struct fid_cntr *counter;
     uint64_t submitted_ops;
+    uint64_t completed_ctr;
     uint64_t completed_staged_atomics;
     int domain_index;
 } nvshmemt_libfabric_endpoint_t;
