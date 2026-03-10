@@ -384,9 +384,8 @@ int nvshmemi_setup_connections(nvshmemi_state_t *state) {
             continue;
         }
 
-        int n_gpus_node = 0;
-        cudaError_t cuda_status = cudaGetDeviceCount(&n_gpus_node);
-        if (cuda_status != cudaSuccess || n_gpus_node <= 0) {
+        int n_gpus_node = get_nvidia_gpu_count();
+        if (n_gpus_node <= 0) {
             n_gpus_node = state->npes_node;
         }
 

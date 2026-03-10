@@ -9,6 +9,7 @@
 #include <cuda.h>                                    // for CUDA_SUCCESS
 #include <cuda_runtime.h>                            // for cudaDevice...
 #include <driver_types.h>                            // for cudaDevice...
+#include <dirent.h>                                  // for opendir, readdir
 #include <limits.h>                                  // for PATH_MAX
 #include <stdio.h>                                   // for NULL, fclose
 #include <stdlib.h>                                  // for free, calloc
@@ -48,6 +49,8 @@ enum pci_distance {
 };
 static const int pci_distance_perf[PATH_COUNT] = {4, 4, 3, 2, 1};
 static const char *pci_distance_string[PATH_COUNT] = {"PIX", "PXB", "PHB", "NODE", "SYS"};
+
+#define NVIDIA_DRIVER_PATH "/sys/bus/pci/drivers/nvidia"
 
 static int get_cuda_bus_id(int cuda_dev, char *bus_id) {
     int status = NVSHMEMX_SUCCESS;
@@ -106,6 +109,71 @@ out:
     return status;
 }
 
+static int is_pci_addr(const char *name) {
+    // Match XXXX:XX:XX.X pattern
+    return strlen(name) == 12 && name[4] == ':' && name[7] == ':' && name[10] == '.';
+}
+
+int get_nvidia_gpu_count(void) {
+    DIR *dir = opendir(NVIDIA_DRIVER_PATH);
+    if (!dir) return 0;
+    int count = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (is_pci_addr(ent->d_name)) count++;
+    }
+    closedir(dir);
+    return count;
+}
+
+static int get_gpu_paths_and_index(int cuda_device_id, char **cuda_device_paths,
+                                   int *out_mygpu_index) {
+    int status = NVSHMEMX_SUCCESS;
+    char my_bus_id[MAX_BUSID_SIZE];
+    DIR *nvidia_dir = NULL;
+
+    status = get_cuda_bus_id(cuda_device_id, my_bus_id);
+    if (status != NVSHMEMX_SUCCESS) return status;
+    for (int k = 0; k < MAX_BUSID_SIZE; k++)
+        my_bus_id[k] = tolower(my_bus_id[k]);
+
+    nvidia_dir = opendir(NVIDIA_DRIVER_PATH);
+    if (!nvidia_dir) {
+        NVSHMEMI_ERROR_PRINT("Failed to open " NVIDIA_DRIVER_PATH "\n");
+        return NVSHMEMX_ERROR_INTERNAL;
+    }
+
+    int gpu_id = 0;
+    *out_mygpu_index = -1;
+    struct dirent *ent;
+    while ((ent = readdir(nvidia_dir)) != NULL) {
+        if (!is_pci_addr(ent->d_name)) continue;
+        char bus_id[MAX_BUSID_SIZE];
+        strncpy(bus_id, ent->d_name, MAX_BUSID_SIZE - 1);
+        bus_id[MAX_BUSID_SIZE - 1] = '\0';
+
+        status = get_device_path(bus_id, &cuda_device_paths[gpu_id]);
+        if (status != NVSHMEMX_SUCCESS) {
+            NVSHMEMI_ERROR_PRINT("get cuda path failed\n");
+            closedir(nvidia_dir);
+            return status;
+        }
+
+        if (strncmp(my_bus_id, bus_id, MAX_BUSID_SIZE) == 0)
+            *out_mygpu_index = gpu_id;
+
+        gpu_id++;
+    }
+    closedir(nvidia_dir);
+
+    if (*out_mygpu_index < 0) {
+        NVSHMEMI_ERROR_PRINT("Could not find current GPU in sysfs\n");
+        return NVSHMEMX_ERROR_INTERNAL;
+    }
+
+    return NVSHMEMX_SUCCESS;
+}
+
 static enum pci_distance get_pci_distance(char *cuda_path, char *mlx_path) {
     int score = 0;
     int depth = 0;
@@ -153,7 +221,6 @@ int nvshmemi_get_devices_by_distance(int *device_arr, int max_dev_per_pe,
     int mype = nvshmemi_state->mype;
     int n_pes = nvshmemi_state->npes;
     int n_pes_node = nvshmemi_state->npes_node;
-    CUdevice gpu_device_id;
 
     char **cuda_device_paths = NULL;
     int *gpu_selected_devices = NULL;
@@ -173,12 +240,6 @@ int nvshmemi_get_devices_by_distance(int *device_arr, int max_dev_per_pe,
                               "transport devices (setup_connections) failed \n");
     }
 
-    status = CUPFN(nvshmemi_cuda_syms, cuCtxGetDevice(&gpu_device_id));
-    if (status != CUDA_SUCCESS) {
-        status = NVSHMEMX_ERROR_INTERNAL;
-        goto out;
-    }
-
     /* Allocate data structures start */
     /* Array of dev_info structures of size # of local NICs */
     dev_info_all = (struct dev_info *)calloc(ndev, sizeof(struct dev_info));
@@ -190,39 +251,25 @@ int nvshmemi_get_devices_by_distance(int *device_arr, int max_dev_per_pe,
     NVSHMEMI_NULL_ERROR_JMP(gpu_info_all, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
                             "gpu_info_all allocation failed \n");
 
-    /* Get total number of GPUs on the node */
-    status = cudaGetDeviceCount(&n_gpus_node);
-    if (status != cudaSuccess || n_gpus_node <= 0) {
-        NVSHMEMI_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-                           "cudaGetDeviceCount failed\n");
-    }
-
-    /* array linking each GPU on our node with it's pcie path */
-    cuda_device_paths = (char **)calloc(n_gpus_node, sizeof(char *));
-    NVSHMEMI_NULL_ERROR_JMP(cuda_device_paths, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
-                            "Unable to allocate memory for GPU/NIC Mapping.\n");
-
     used_devs = (int *)calloc(ndev, sizeof(int));
     NVSHMEMI_NULL_ERROR_JMP(used_devs, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
                             "Unable to allocate memory for PE/NIC Mapping.\n");
     /* Allocate data structures end */
 
     /* Gather GPU and NIC paths start */
-    status = get_cuda_bus_id(gpu_device_id, gpu_info.gpu_bus_id);
-    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "get cuda busid failed \n");
-
-    /* Enumerate all GPUs on the node */
-    for (gpu_id = 0; gpu_id < n_gpus_node; gpu_id++) {
-        char gpu_bus_id[MAX_BUSID_SIZE];
-        status = get_cuda_bus_id(gpu_id, gpu_bus_id);
-        NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "get cuda busid failed \n");
-
-        status = get_device_path(gpu_bus_id, &cuda_device_paths[gpu_id]);
-        NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "get cuda path failed \n");
+    n_gpus_node = get_nvidia_gpu_count();
+    if (n_gpus_node <= 0) {
+        NVSHMEMI_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+                           "No NVIDIA GPUs found in " NVIDIA_DRIVER_PATH "\n");
     }
 
-    /* Determine which GPU index corresponds to our device_id */
-    mygpu_index = nvshmemi_state->device_id;
+    cuda_device_paths = (char **)calloc(n_gpus_node, sizeof(char *));
+    NVSHMEMI_NULL_ERROR_JMP(cuda_device_paths, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
+                            "Unable to allocate memory for GPU/NIC Mapping.\n");
+
+    status = get_gpu_paths_and_index(nvshmemi_state->device_id, cuda_device_paths, &mygpu_index);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+                          "get_gpu_paths_and_index failed\n");
     mygpu_array_index = mygpu_index * max_dev_per_pe;
 
     /* Allocate GPU-based arrays */
