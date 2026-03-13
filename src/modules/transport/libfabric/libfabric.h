@@ -5,10 +5,15 @@
  */
 
 #include <assert.h>
+#include <atomic>
+#include <linux/futex.h>
+#include <pthread.h>
 #include <stdint.h>  // IWYU pragma: keep
 #include <stdio.h>
 #include <cstdlib>
 #include <stddef.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <string.h>
 #include <atomic>
 #include <array>
@@ -565,6 +570,48 @@ typedef struct {
     std::vector<uint32_t> next_expected_seq;
 } nvshmemt_libfabric_signal_state_t;
 
+struct signal_delivery_work_entry {
+    nvshmemt_libfabric_gdr_op_ctx_t *op;
+    nvshmemt_libfabric_gdr_op_ctx_t *send_elems[2];
+    uint32_t sequence_count;
+};
+
+struct signal_delivery_done_entry {
+    nvshmemt_libfabric_gdr_op_ctx_t *op;
+    nvshmemt_libfabric_gdr_op_ctx_t *send_elems[2];
+    uint32_t sequence_count;
+    int src_pe;
+    fi_addr_t src_addr;
+    nvshmemt_libfabric_endpoint_t *ep;
+    bool is_fetch_amo;
+    uint64_t old_value;
+    uint64_t ret_flags;
+    void *ret_addr;
+};
+
+template <typename T, int CAPACITY = 1024>
+class SPSCRing {
+    T ring[CAPACITY];
+    alignas(64) std::atomic<int> head{0};
+    alignas(64) std::atomic<int> tail{0};
+   public:
+    bool push(const T &entry) {
+        int h = head.load(std::memory_order_relaxed);
+        int next = (h + 1) % CAPACITY;
+        if (next == tail.load(std::memory_order_acquire)) return false;
+        ring[h] = entry;
+        head.store(next, std::memory_order_release);
+        return true;
+    }
+    bool pop(T &entry) {
+        int t = tail.load(std::memory_order_relaxed);
+        if (t == head.load(std::memory_order_acquire)) return false;
+        entry = ring[t];
+        tail.store((t + 1) % CAPACITY, std::memory_order_release);
+        return true;
+    }
+};
+
 typedef struct {
     struct fi_info *all_prov_info;
     std::vector<struct fi_info *> prov_infos;
@@ -607,6 +654,15 @@ typedef struct {
 
     /* Max ops per progress iteration */
     int proxy_request_batch_max;
+
+    /* Signal delivery thread (v2: queue-based, no libfabric sharing) */
+    pthread_t signal_delivery_thread;
+    std::atomic<int> signal_delivery_stop{0};
+    void *signal_delivery_transport;
+    std::atomic<int> signal_work_futex{0};
+    std::atomic_flag signal_queue_lock = ATOMIC_FLAG_INIT;
+    SPSCRing<signal_delivery_work_entry> signal_work_queue;
+    SPSCRing<signal_delivery_done_entry> signal_done_queue;
 } nvshmemt_libfabric_state_t;
 
 typedef struct {
