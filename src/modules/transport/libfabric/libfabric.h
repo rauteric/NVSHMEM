@@ -220,6 +220,7 @@ typedef enum {
     NVSHMEMT_LIBFABRIC_SEND,
     NVSHMEMT_LIBFABRIC_ACK,
     NVSHMEMT_LIBFABRIC_MATCH,
+    NVSHMEMT_LIBFABRIC_PUT_ACK_PASSTHROUGH,
 } nvshmemt_libfabric_recv_t;
 
 typedef enum {
@@ -316,6 +317,7 @@ typedef enum {
     NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT,
     NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_WITH_ACK_REQ,
     NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_ACK,
+    NVSHMEMT_LIBFABRIC_MSG_COALESCED_ACK,
 } nvshmemt_libfabric_imm_cq_data_hdr_t;
 
 /*
@@ -492,6 +494,7 @@ typedef struct {
     std::unordered_map<int, nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
     std::unordered_map<uint64_t, nvshmemt_libfabric_comp_entry_t> *proxy_put_signal_comp_map;
     std::unordered_map<int, uint32_t> *next_expected_seq;
+    struct nvshmemt_libfabric_ack_aggregator_t *ack_aggregator;
 } nvshmemt_libfabric_signal_state_t;
 
 struct signal_delivery_work_entry {
@@ -581,6 +584,10 @@ typedef struct {
     std::atomic_flag signal_queue_lock = ATOMIC_FLAG_INIT;
     SPSCRing<signal_delivery_work_entry> signal_work_queue;
     SPSCRing<signal_delivery_done_entry> signal_done_queue;
+
+    /* Put ack passthrough pool: pre-allocated op_ctx entries for routing
+     * standalone put acks through the signal delivery pipeline */
+    std::vector<nvshmemt_libfabric_gdr_op_ctx_t *> put_ack_passthrough_pool;
 } nvshmemt_libfabric_state_t;
 
 typedef struct {
@@ -619,3 +626,45 @@ typedef struct nvshmemt_libfabric_gdr_signal_op {
 } nvshmemt_libfabric_gdr_signal_op_t;
 /*  EFA's inline send size is 32 bytes */
 static_assert(sizeof(nvshmemt_libfabric_gdr_signal_op_t) == 32);
+
+/* Wire format for coalesced ack message, sent via fi_send inline.
+ * 24 bytes
+ * | 4 header | 4 src_pe | 4 range_start | 4 range_count | 4 amo_ack_count | 4 reserved |
+ */
+struct nvshmemt_libfabric_coalesced_ack_t {
+    uint32_t header;        /* NVSHMEMT_LIBFABRIC_MSG_COALESCED_ACK */
+    uint32_t src_pe;        /* Source peer ID (the receiver sending the ack) */
+    uint32_t range_start;   /* Start of put/signal sequence number range */
+    uint32_t range_count;   /* Number of contiguous sequence numbers in range */
+    uint32_t amo_ack_count; /* Number of AMO acks (dummy seq num operations) */
+    uint32_t reserved;      /* Padding / future use */
+};
+static_assert(sizeof(nvshmemt_libfabric_coalesced_ack_t) <= 32);
+
+struct nvshmemt_libfabric_peer_pending_acks_t {
+    /* Contiguous range tracking for put/signal acks */
+    uint32_t range_start;   /* First sequence number in pending range */
+    uint32_t range_count;   /* Number of contiguous sequence numbers */
+    bool has_range;          /* Whether a range is active */
+
+    /* AMO ack count (operations using NVSHMEM_STAGED_AMO_SEQ_NUM) */
+    uint32_t amo_ack_count;
+
+    /* Total pending acks (range_count + amo_ack_count) for threshold check */
+    uint32_t total_pending() const { return range_count + amo_ack_count; }
+};
+
+struct nvshmemt_libfabric_ack_aggregator_t {
+    std::unordered_map<int, nvshmemt_libfabric_peer_pending_acks_t> pending_per_peer;
+    std::vector<int> dirty_peers; /* PEs with non-zero pending acks */
+    uint32_t flush_threshold;     /* Default: 16 */
+
+    void record_ack(int pe, uint32_t seq_num, nvshmem_transport_t transport,
+                    nvshmemt_libfabric_endpoint_t *ep, fi_addr_t dest_addr);
+    void record_amo_ack(int pe, nvshmem_transport_t transport,
+                        nvshmemt_libfabric_endpoint_t *ep, fi_addr_t dest_addr);
+    int flush_peer(int pe, nvshmem_transport_t transport,
+                   nvshmemt_libfabric_endpoint_t *ep, fi_addr_t dest_addr);
+    int flush_all(nvshmem_transport_t transport,
+                  nvshmemt_libfabric_endpoint_t *ep);
+};
