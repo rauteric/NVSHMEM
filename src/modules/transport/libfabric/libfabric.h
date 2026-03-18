@@ -6,10 +6,13 @@
 
 #include <assert.h>
 #include <atomic>
+#include <linux/futex.h>
 #include <pthread.h>
 #include <stdint.h>  // IWYU pragma: keep
 #include <stdio.h>
 #include <stddef.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <string.h>
 #include <atomic>
 #include <array>
@@ -623,6 +626,7 @@ typedef struct {
     pthread_t signal_delivery_thread;
     std::atomic<int> signal_delivery_stop{0};
     void *signal_delivery_transport;
+    std::atomic<int> signal_work_futex{0};
     std::atomic_flag signal_queue_lock = ATOMIC_FLAG_INIT;
     SPSCRing<signal_delivery_work_entry> signal_work_queue;
     SPSCRing<signal_delivery_done_entry> signal_done_queue;

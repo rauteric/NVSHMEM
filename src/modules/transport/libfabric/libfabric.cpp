@@ -712,12 +712,16 @@ static void *nvshmemt_libfabric_signal_delivery_thread(void *arg) {
         }
     }
     while (!state->signal_delivery_stop.load(std::memory_order_relaxed)) {
-        if (state->signal_work_queue.pop(work)) {
-            nvshmemt_libfabric_gdr_process_amo(transport, work.op, work.send_elems,
-                                               work.sequence_count);
-        } else {
-            _mm_pause();
+        if (!state->signal_work_queue.pop(work)) {
+            state->signal_work_futex.store(0, std::memory_order_release);
+            /* Re-check after store to avoid missed wake */
+            if (!state->signal_work_queue.pop(work)) {
+                syscall(SYS_futex, &state->signal_work_futex, FUTEX_WAIT, 0, NULL, NULL, 0);
+                continue;
+            }
         }
+        nvshmemt_libfabric_gdr_process_amo(transport, work.op, work.send_elems,
+                                        work.sequence_count);
     }
     return NULL;
 }
@@ -750,6 +754,11 @@ static int nvshmemt_libfabric_progress(nvshmem_transport_t transport, int qp_ind
         libfabric_state->signal_queue_lock.clear(std::memory_order_release);
         if (unlikely(status)) {
             return NVSHMEMX_ERROR_INTERNAL;
+        }
+
+        /* Wake Thread B only if it might be sleeping (futex was 0) */
+        if (libfabric_state->signal_work_futex.exchange(1, std::memory_order_release) == 0) {
+            syscall(SYS_futex, &libfabric_state->signal_work_futex, FUTEX_WAKE, 1, NULL, NULL, 0);
         }
     }
 
@@ -2315,7 +2324,9 @@ static int nvshmemt_libfabric_finalize(nvshmem_transport_t transport) {
 
     /* Stop signal delivery thread before tearing down resources */
     if (use_staged_atomics && libfabric_state->signal_delivery_transport) {
-        libfabric_state->signal_delivery_stop.store(1, std::memory_order_relaxed);
+        libfabric_state->signal_delivery_stop.store(1, std::memory_order_seq_cst);
+        libfabric_state->signal_work_futex.store(1, std::memory_order_release);
+        syscall(SYS_futex, &libfabric_state->signal_work_futex, FUTEX_WAKE, 1, NULL, NULL, 0);
         pthread_join(libfabric_state->signal_delivery_thread, NULL);
     }
 
