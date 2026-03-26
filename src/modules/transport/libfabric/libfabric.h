@@ -316,6 +316,7 @@ typedef enum {
     NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT,
     NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_WITH_ACK_REQ,
     NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_ACK,
+    NVSHMEMT_LIBFABRIC_MSG_COALESCED_ACK, /* message-based coalesced ack (fi_send payload) */
 } nvshmemt_libfabric_imm_cq_data_hdr_t;
 
 /*
@@ -492,6 +493,7 @@ typedef struct {
     std::unordered_map<int, nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
     std::unordered_map<uint64_t, nvshmemt_libfabric_comp_entry_t> *proxy_put_signal_comp_map;
     std::unordered_map<int, uint32_t> *next_expected_seq;
+    struct nvshmemt_libfabric_ack_aggregator *ack_aggregator;
 } nvshmemt_libfabric_signal_state_t;
 
 struct signal_delivery_work_entry {
@@ -619,3 +621,50 @@ typedef struct nvshmemt_libfabric_gdr_signal_op {
 } nvshmemt_libfabric_gdr_signal_op_t;
 /*  EFA's inline send size is 32 bytes */
 static_assert(sizeof(nvshmemt_libfabric_gdr_signal_op_t) == 32);
+
+/* Wire format for coalesced ack message, sent via fi_send inline */
+typedef struct nvshmemt_libfabric_coalesced_ack {
+    uint32_t header;        /* NVSHMEMT_LIBFABRIC_MSG_COALESCED_ACK */
+    uint32_t src_pe;        /* PE ID of the receiver sending the ack */
+    uint32_t range_start;   /* Start of signal sequence number range */
+    uint32_t range_count;   /* Count of contiguous sequence numbers */
+    uint32_t amo_ack_count; /* Count of AMO acks (NVSHMEM_STAGED_AMO_SEQ_NUM) */
+    uint32_t reserved;      /* Padding / future use */
+} nvshmemt_libfabric_coalesced_ack_t;
+static_assert(sizeof(nvshmemt_libfabric_coalesced_ack_t) <= 32);
+
+/* Per-peer pending ack state for the ack aggregator */
+struct nvshmemt_libfabric_peer_pending_acks {
+    uint32_t range_start;
+    uint32_t range_count;
+    bool has_range;
+    uint32_t amo_ack_count;
+
+    nvshmemt_libfabric_peer_pending_acks() : range_start(0), range_count(0),
+                                              has_range(false), amo_ack_count(0) {}
+
+    uint32_t total_pending() const { return range_count + amo_ack_count; }
+};
+typedef struct nvshmemt_libfabric_peer_pending_acks nvshmemt_libfabric_peer_pending_acks_t;
+
+/* Forward declarations needed by ack_aggregator methods */
+struct nvshmem_transport;
+typedef struct nvshmem_transport *nvshmem_transport_t;
+
+/* Ack aggregator: accumulates signal/AMO acks per peer, flushes as coalesced fi_send */
+struct nvshmemt_libfabric_ack_aggregator {
+    std::unordered_map<int, nvshmemt_libfabric_peer_pending_acks_t> pending_per_peer;
+    std::vector<int> dirty_peers;
+    uint32_t flush_threshold;
+
+    nvshmemt_libfabric_ack_aggregator() : flush_threshold(16) {}
+
+    void record_ack(int pe, uint32_t seq_num, nvshmem_transport_t transport,
+                    nvshmemt_libfabric_endpoint_t *ep, fi_addr_t dest_addr);
+    void record_amo_ack(int pe, nvshmem_transport_t transport,
+                        nvshmemt_libfabric_endpoint_t *ep, fi_addr_t dest_addr);
+    int flush_peer(int pe, nvshmem_transport_t transport,
+                   nvshmemt_libfabric_endpoint_t *ep, fi_addr_t dest_addr);
+    int flush_all(nvshmem_transport_t transport, nvshmemt_libfabric_endpoint_t *ep);
+};
+typedef struct nvshmemt_libfabric_ack_aggregator nvshmemt_libfabric_ack_aggregator_t;
