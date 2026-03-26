@@ -201,28 +201,14 @@ struct nvshmemt_libfabric_endpoint_seq_counter_t {
     }
 
     /**
-     * Mark a range of sequence numbers as complete, resulting from reciving a
-     * put ack. The sequence range ends with end_seq.
-     *
-     * We send an ack for every NVSHMEM_STAGED_AMO_PUT_ACK_FREQ puts. Therefore,
-     * a put ack for <end_seq> is an acknowledgement sequence numbers (end_seq -
-     * NVSHMEM_STAGED_AMO_PUT_ACK_FREQ + 1) to end_seq, inclusive. The
-     * wraparound case is also handled.
-     *
-     * This code assumes the sequence range spans at most two categories. This
-     * will be true as long as the index space is sufficiently larger than the
-     * put ack frequency, as static asserted above.
+     * Mark a range of sequence numbers as complete
      */
-    void return_acked_seq_num_range_for_put(uint32_t end_seq) {
-        assert(end_seq != NVSHMEM_STAGED_AMO_SEQ_NUM);
-
-        uint32_t start_seq = (end_seq - NVSHMEM_STAGED_AMO_PUT_ACK_FREQ + 1) & sequence_mask;
-
+    void return_acked_seq_num_range(uint32_t start_seq, uint32_t end_seq) {
         /* Note: in the wraparound case, the (start_seq, end_seq) range will
            include NVSHMEM_STAGED_AMO_SEQ_NUM, which is not used. The logic
            below handles this correctly, as long as `start_category` is correct
            (which is true as long as the index space is sufficiently large that
-           we can only span two categories, as static-asserted above.) */
+           we can only span two categories.) */
 
         uint32_t start_category = get_category(start_seq);
         uint32_t end_category = get_category(end_seq);
@@ -248,6 +234,27 @@ struct nvshmemt_libfabric_endpoint_seq_counter_t {
             pending_acks[end_category] -= count_in_end_cat;
         }
     }
+
+    /**
+     * Mark a range of sequence numbers as complete, resulting from reciving a
+     * put ack. The sequence range ends with end_seq.
+     *
+     * We send an ack for every NVSHMEM_STAGED_AMO_PUT_ACK_FREQ puts. Therefore,
+     * a put ack for <end_seq> is an acknowledgement sequence numbers (end_seq -
+     * NVSHMEM_STAGED_AMO_PUT_ACK_FREQ + 1) to end_seq, inclusive. The
+     * wraparound case is also handled.
+     *
+     * This code assumes the sequence range spans at most two categories. This
+     * will be true as long as the index space is sufficiently larger than the
+     * put ack frequency, as static asserted above.
+     */
+    void return_acked_seq_num_range_for_put(uint32_t end_seq) {
+        assert(end_seq != NVSHMEM_STAGED_AMO_SEQ_NUM);
+
+        uint32_t start_seq = (end_seq - NVSHMEM_STAGED_AMO_PUT_ACK_FREQ + 1) & sequence_mask;
+
+        return_acked_seq_num_range(start_seq, end_seq);
+    }
 };
 
 typedef enum {
@@ -270,7 +277,6 @@ typedef struct {
     struct fid_cntr *counter;
     uint64_t submitted_ops;
     uint64_t completed_ops;
-    uint64_t completed_staged_atomics;
     int domain_index;
     int ep_index;
     int qp_index;
@@ -356,6 +362,7 @@ typedef enum {
     NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT,
     NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_WITH_ACK_REQ,
     NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_ACK,
+    NVSHMEMT_LIBFABRIC_MSG_COALESCED_ACK, /* message-based coalesced ack (fi_send payload) */
 } nvshmemt_libfabric_imm_cq_data_hdr_t;
 
 /*
@@ -567,17 +574,19 @@ typedef struct {
     std::vector<nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
     std::vector<signal_seq_map> *proxy_put_signal_comp_map;
     std::vector<uint32_t> *next_expected_seq;
+    struct nvshmemt_libfabric_ack_aggregator *ack_aggregator;
+    uint64_t completed_staged_atomics;
 } nvshmemt_libfabric_signal_state_t;
 
 struct signal_delivery_work_entry {
     nvshmemt_libfabric_gdr_op_ctx_t *op;
-    nvshmemt_libfabric_gdr_op_ctx_t *send_elems[2];
+    nvshmemt_libfabric_gdr_op_ctx_t *send_elems[2] = {NULL, NULL};
     uint32_t sequence_count;
 };
 
 struct signal_delivery_done_entry {
     nvshmemt_libfabric_gdr_op_ctx_t *op;
-    nvshmemt_libfabric_gdr_op_ctx_t *send_elems[2];
+    nvshmemt_libfabric_gdr_op_ctx_t *send_elems[2] = {NULL, NULL};
     uint32_t sequence_count;
     int src_pe;
     fi_addr_t src_addr;
@@ -717,3 +726,50 @@ typedef struct nvshmemt_libfabric_gdr_signal_op {
 } nvshmemt_libfabric_gdr_signal_op_t;
 /*  EFA's inline send size is 32 bytes */
 static_assert(sizeof(nvshmemt_libfabric_gdr_signal_op_t) == 32);
+
+/* Wire format for coalesced ack message, sent via fi_send inline */
+typedef struct nvshmemt_libfabric_coalesced_ack {
+    uint32_t header;        /* NVSHMEMT_LIBFABRIC_MSG_COALESCED_ACK */
+    uint32_t src_pe;        /* PE ID of the receiver sending the ack */
+    uint32_t range_start;   /* Start of signal sequence number range */
+    uint32_t range_count;   /* Count of contiguous sequence numbers */
+    uint32_t amo_ack_count; /* Count of AMO acks (NVSHMEM_STAGED_AMO_SEQ_NUM) */
+    uint32_t reserved;      /* Padding / future use */
+} nvshmemt_libfabric_coalesced_ack_t;
+static_assert(sizeof(nvshmemt_libfabric_coalesced_ack_t) <= 32);
+
+/* Per-peer pending ack state for the ack aggregator */
+struct nvshmemt_libfabric_peer_pending_acks {
+    uint32_t range_start;
+    uint32_t range_count;
+    bool has_range;
+    uint32_t amo_ack_count;
+
+    nvshmemt_libfabric_peer_pending_acks() : range_start(0), range_count(0),
+                                              has_range(false), amo_ack_count(0) {}
+
+    uint32_t total_pending() const { return range_count + amo_ack_count; }
+};
+typedef struct nvshmemt_libfabric_peer_pending_acks nvshmemt_libfabric_peer_pending_acks_t;
+
+/* Forward declarations needed by ack_aggregator methods */
+struct nvshmem_transport;
+typedef struct nvshmem_transport *nvshmem_transport_t;
+
+/* Ack aggregator: accumulates signal/AMO acks per peer, flushes as coalesced fi_send */
+struct nvshmemt_libfabric_ack_aggregator {
+    std::unordered_map<int, nvshmemt_libfabric_peer_pending_acks_t> pending_per_peer;
+    std::vector<int> dirty_peers;
+    uint32_t flush_threshold;
+
+    nvshmemt_libfabric_ack_aggregator() : flush_threshold(16) {}
+
+    void record_ack(int pe, uint32_t seq_num, nvshmem_transport_t transport,
+                    nvshmemt_libfabric_endpoint_t *ep, fi_addr_t dest_addr);
+    void record_amo_ack(int pe, nvshmem_transport_t transport,
+                        nvshmemt_libfabric_endpoint_t *ep, fi_addr_t dest_addr);
+    int flush_peer(int pe, nvshmem_transport_t transport,
+                   nvshmemt_libfabric_endpoint_t *ep, fi_addr_t dest_addr);
+    int flush_all(nvshmem_transport_t transport, nvshmemt_libfabric_endpoint_t *ep);
+};
+typedef struct nvshmemt_libfabric_ack_aggregator nvshmemt_libfabric_ack_aggregator_t;
