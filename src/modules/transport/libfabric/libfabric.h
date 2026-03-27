@@ -498,13 +498,13 @@ typedef struct {
 
 struct signal_delivery_work_entry {
     nvshmemt_libfabric_gdr_op_ctx_t *op;
-    nvshmemt_libfabric_gdr_op_ctx_t *send_elems[2];
+    nvshmemt_libfabric_gdr_op_ctx_t *send_elems[2] = {NULL, NULL};
     uint32_t sequence_count;
 };
 
 struct signal_delivery_done_entry {
     nvshmemt_libfabric_gdr_op_ctx_t *op;
-    nvshmemt_libfabric_gdr_op_ctx_t *send_elems[2];
+    nvshmemt_libfabric_gdr_op_ctx_t *send_elems[2] = {NULL, NULL};
     uint32_t sequence_count;
     int src_pe;
     fi_addr_t src_addr;

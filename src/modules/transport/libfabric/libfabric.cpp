@@ -249,6 +249,9 @@ static int nvshmemt_libfabric_gdr_process_completion(nvshmem_transport_t transpo
             if (coal_ack->amo_ack_count > 0) {
                 ep->completed_staged_atomics += coal_ack->amo_ack_count;
             }
+            if (coal_ack->range_count > 0) {
+                ep->completed_staged_atomics += coal_ack->range_count;
+            }
 
             /* Re-post recv buffer */
             status = fi_recv(ep->endpoint, (void *)op, NVSHMEM_STAGED_AMO_WIREDATA_SIZE,
@@ -709,6 +712,7 @@ int perform_gdrcopy_amo(nvshmem_transport_t transport, nvshmemt_libfabric_gdr_op
     nvshmemt_libfabric_gdr_send_amo_op_t *received_op = &(op->send_amo);
     nvshmemt_libfabric_gdr_op_ctx_t *resp_op = NULL;
     nvshmemt_libfabric_memhandle_info_t *handle_info;
+    signal_delivery_done_entry done;
     volatile T *ptr;
     int status = 0;
     /* Save op fields as registers to allow posting op as RX before TX */
@@ -785,7 +789,6 @@ int perform_gdrcopy_amo(nvshmem_transport_t transport, nvshmemt_libfabric_gdr_op
     STORE_BARRIER();
 
     /* Push to done_queue for Thread A to handle EP ops */
-    signal_delivery_done_entry done;
     done.op = op;
     done.send_elems[0] = send_elems[0];
     done.send_elems[1] = send_elems[1];
@@ -966,7 +969,7 @@ out:
 int nvshmemt_libfabric_gdr_process_amos(nvshmem_transport_t transport, int qp_index) {
     nvshmemt_libfabric_state_t *libfabric_state = (nvshmemt_libfabric_state_t *)transport->state;
     nvshmemt_libfabric_gdr_op_ctx_t *op;
-    nvshmemt_libfabric_gdr_op_ctx_t *send_elems[2];
+    nvshmemt_libfabric_gdr_op_ctx_t *send_elems[2] = {NULL, NULL};
     int status = 0;
     int end_iter;
 
@@ -984,6 +987,7 @@ int nvshmemt_libfabric_gdr_process_amos(nvshmem_transport_t transport, int qp_in
         int ops_processed = 0;
 
         do {
+            send_elems[1] = NULL;
             status = libfabric_state->op_queue[i]->getNextAmoOps(send_elems, &op,
                                                                 NVSHMEMT_LIBFABRIC_RECV_TYPE_NOT_ACK);
             if (status == -EAGAIN) {
