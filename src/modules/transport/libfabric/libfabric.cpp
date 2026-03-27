@@ -720,7 +720,8 @@ static int nvshmemt_libfabric_gdr_process_completion(nvshmem_transport_t transpo
     nvshmemt_libfabric_state_t *state = (nvshmemt_libfabric_state_t *)transport->state;
     int domain_idx = ep.domain_index;
 
-    /* Write w/imm doesn't have op->op_context, must be checked first */
+    /* With FI_RX_CQ_DATA, write w/imm consumes a posted recv buffer.
+     * op_context points to the recv buffer context. */
     if (entry->flags & FI_REMOTE_CQ_DATA) {
         nvshmemt_libfabric_imm_cq_data_hdr_t imm_header =
             get_write_with_imm_hdr(entry->data);
@@ -729,11 +730,20 @@ static int nvshmemt_libfabric_gdr_process_completion(nvshmem_transport_t transpo
             NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_WITH_ACK_REQ == imm_header) {
             status = nvshmemt_libfabric_put_signal_completion(transport, ep, entry, addr);
             NVSHMEM_TRACE_WRITE_REMOTE_COMPLETION(ep.domain_index, (uint64_t)(addr ? *addr : 0), (int)imm_header);
-            goto out;
         } else {
             NVSHMEMI_ERROR_JMP(status, NVSHMEMX_ERROR_INVALID_VALUE, out,
                                "Received a write w/imm completion with invalid header type.\n");
         }
+        /* Repost the recv buffer consumed by the remote write completion */
+        if (!status) {
+            op = container_of(entry->op_context, nvshmemt_libfabric_gdr_op_ctx_t, ofi_context);
+            status =
+                fi_recv(ep.endpoint, (void *)op, NVSHMEM_STAGED_AMO_WIREDATA_SIZE,
+                        fi_mr_desc(state->mrs[domain_idx]), FI_ADDR_UNSPEC, &op->ofi_context);
+            NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
+                                  "Unable to re-post recv after write w/imm.\n");
+        }
+        goto out;
     }
 
     op = container_of(entry->op_context, nvshmemt_libfabric_gdr_op_ctx_t, ofi_context);
@@ -2700,6 +2710,10 @@ static int nvshmemi_libfabric_init_state(nvshmem_transport_t t, nvshmemt_libfabr
     } else if (state->provider == NVSHMEMT_LIBFABRIC_PROVIDER_EFA) {
         hints->caps |= FI_MSG | FI_SOURCE;
         hints->domain_attr->mr_mode |= FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_HMEM;
+        /* Request FI_RX_CQ_DATA to disable unsolicited write completions.
+         * This requires the application to post recv buffers for remote write w/imm. */
+        hints->mode |= FI_RX_CQ_DATA;
+        hints->domain_attr->cq_data_size = 4;
     }
 
     if (use_staged_atomics) {
@@ -2744,6 +2758,13 @@ static int nvshmemi_libfabric_init_state(nvshmem_transport_t t, nvshmemt_libfabr
         NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
                               "No providers matched fi_getinfo query: %d: %s\n", status,
                               fi_strerror(status * -1));
+    }
+
+    /* Verify EFA provider returned FI_RX_CQ_DATA support */
+    if (state->provider == NVSHMEMT_LIBFABRIC_PROVIDER_EFA) {
+        NVSHMEMI_CHECK_ERROR_JMP(!(all_infos->mode & FI_RX_CQ_DATA), status,
+                                 NVSHMEMX_ERROR_INTERNAL, out,
+                                 "EFA provider does not support FI_RX_CQ_DATA.\n");
     }
 
     state->all_prov_info = all_infos;
