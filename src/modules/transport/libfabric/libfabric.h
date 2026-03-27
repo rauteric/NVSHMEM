@@ -232,7 +232,6 @@ typedef struct {
     struct fid_cq *cq;
     struct fid_cntr *counter;
     uint64_t submitted_ops;
-    uint64_t completed_staged_atomics;
     int domain_index;
 } nvshmemt_libfabric_endpoint_t;
 
@@ -494,6 +493,7 @@ typedef struct {
     std::unordered_map<uint64_t, nvshmemt_libfabric_comp_entry_t> *proxy_put_signal_comp_map;
     std::unordered_map<int, uint32_t> *next_expected_seq;
     struct nvshmemt_libfabric_ack_aggregator *ack_aggregator;
+    uint64_t completed_staged_atomics;
 } nvshmemt_libfabric_signal_state_t;
 
 struct signal_delivery_work_entry {

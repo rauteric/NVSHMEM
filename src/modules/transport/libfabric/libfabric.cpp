@@ -161,11 +161,10 @@ static void nvshmemt_libfabric_put_signal_ack_completion(nvshmemt_libfabric_stat
                                                          fi_addr_t addr) {
     uint32_t seq_num = entry->data & NVSHMEM_STAGED_AMO_PUT_SIGNAL_SEQ_CNTR_BIT_MASK;
 
-    if (seq_num != NVSHMEM_STAGED_AMO_SEQ_NUM) {
-        /* Use host_signal_state for eps[0], proxy_signal_state for eps[1+] */
-        nvshmemt_libfabric_signal_state_t *signal_state =
-            (ep->domain_index == 0) ? &state->host_signal_state : &state->proxy_signal_state;
+    nvshmemt_libfabric_signal_state_t *signal_state =
+        (ep->domain_index == 0) ? &state->host_signal_state : &state->proxy_signal_state;
 
+    if (seq_num != NVSHMEM_STAGED_AMO_SEQ_NUM) {
         int pe = convert_addr_to_pe(state, ep, addr);
         nvshmemt_libfabric_imm_cq_data_hdr_t imm_header =
             nvshmemt_get_write_with_imm_hdr(entry->data);
@@ -181,7 +180,7 @@ static void nvshmemt_libfabric_put_signal_ack_completion(nvshmemt_libfabric_stat
         }
     }
 
-    ep->completed_staged_atomics++;
+    signal_state->completed_staged_atomics++;
 }
 
 static inline bool is_signal_only_op(nvshmemi_amo_t op) {
@@ -247,10 +246,10 @@ static int nvshmemt_libfabric_gdr_process_completion(nvshmem_transport_t transpo
                     .return_acked_seq_num_range(coal_ack->range_start, end_seq);
             }
             if (coal_ack->amo_ack_count > 0) {
-                ep->completed_staged_atomics += coal_ack->amo_ack_count;
+                signal_state->completed_staged_atomics += coal_ack->amo_ack_count;
             }
             if (coal_ack->range_count > 0) {
-                ep->completed_staged_atomics += coal_ack->range_count;
+                signal_state->completed_staged_atomics += coal_ack->range_count;
             }
 
             /* Re-post recv buffer */
@@ -1171,7 +1170,6 @@ out:
 static int nvshmemt_libfabric_quiet(struct nvshmem_transport *tcurr, int pe, int qp_index) {
     nvshmemt_libfabric_state_t *state = (nvshmemt_libfabric_state_t *)tcurr->state;
     uint64_t completed;
-    bool all_nics_quieted;
     int status = 0;
     int end_iter;
 
@@ -1183,20 +1181,22 @@ static int nvshmemt_libfabric_quiet(struct nvshmem_transport *tcurr, int pe, int
     }
 
     if (use_staged_atomics) {
+        nvshmemt_libfabric_signal_state_t *signal_state =
+            (qp_index == NVSHMEMX_QP_HOST) ? &state->host_signal_state
+                                           : &state->proxy_signal_state;
         for (;;) {
-            all_nics_quieted = true;
+            uint64_t total_submitted = 0;
+            uint64_t total_counter = 0;
             for (int i = qp_index; i < end_iter; i++) {
-                completed = fi_cntr_read(state->eps[i]->counter) +
-                            state->eps[i]->completed_staged_atomics;
-                if (state->eps[i]->submitted_ops != completed) {
-                    all_nics_quieted = false;
-                    if (nvshmemt_libfabric_progress(tcurr, qp_index)) {
-                        status = NVSHMEMX_ERROR_INTERNAL;
-                        break;
-                    }
-                }
+                total_submitted += state->eps[i]->submitted_ops;
+                total_counter += fi_cntr_read(state->eps[i]->counter);
             }
-            if (status || all_nics_quieted) break;
+            completed = total_counter + signal_state->completed_staged_atomics;
+            if (total_submitted == completed) break;
+            if (nvshmemt_libfabric_progress(tcurr, qp_index)) {
+                status = NVSHMEMX_ERROR_INTERNAL;
+                break;
+            }
         }
     } else {
         for (int i = qp_index; i < end_iter; i++) {
@@ -2114,6 +2114,8 @@ static int nvshmemt_libfabric_connect_endpoints(nvshmem_transport_t t, int *sele
 
     state->host_signal_state.ack_aggregator = new nvshmemt_libfabric_ack_aggregator_t();
     state->proxy_signal_state.ack_aggregator = new nvshmemt_libfabric_ack_aggregator_t();
+    state->host_signal_state.completed_staged_atomics = 0;
+    state->proxy_signal_state.completed_staged_atomics = 0;
 
     /* Create Resources For Each Selected Device */
     for (size_t i = 0; i < state->prov_infos.size(); i++) {
@@ -2173,8 +2175,6 @@ static int nvshmemt_libfabric_connect_endpoints(nvshmem_transport_t t, int *sele
         NVSHMEMI_NULL_ERROR_JMP(state->eps[i], status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
                                 "Unable to alloc libfabric_tx_progress_group struct.\n");
         state->eps[i]->domain_index = i;
-
-        state->eps[i]->completed_staged_atomics = 0;
 
         status = fi_cq_open(domain, &cq_attr, &state->eps[i]->cq, NULL);
         NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
