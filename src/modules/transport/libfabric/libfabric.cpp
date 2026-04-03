@@ -23,6 +23,9 @@
 #include <memory>
 #include <errno.h>
 #include <sched.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "nvshmem_libfabric_tracepoint.h"
 #ifdef NVSHMEM_X86_64
@@ -698,6 +701,17 @@ static int nvshmemt_libfabric_process_completions(nvshmem_transport_t transport,
     return status;
 }
 
+static inline void nvshmemt_libfabric_futex_wait(std::atomic<uint32_t> *futex) {
+    uint32_t expected = 0;
+    /* Only sleep if the value is still 0 (no work). Avoids lost wake-ups. */
+    syscall(SYS_futex, futex, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, expected, NULL, NULL, 0);
+}
+
+static inline void nvshmemt_libfabric_futex_wake(std::atomic<uint32_t> *futex) {
+    futex->store(1, std::memory_order_release);
+    syscall(SYS_futex, futex, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, NULL, NULL, 0);
+}
+
 static void *nvshmemt_libfabric_signal_delivery_thread(void *arg) {
     nvshmemt_libfabric_state_t *state = (nvshmemt_libfabric_state_t *)arg;
     nvshmem_transport_t transport = (nvshmem_transport_t)state->signal_delivery_transport;
@@ -716,7 +730,14 @@ static void *nvshmemt_libfabric_signal_delivery_thread(void *arg) {
             nvshmemt_libfabric_gdr_process_amo(transport, work.op, work.send_elems,
                                                work.sequence_count);
         } else {
-            _mm_pause();
+            state->signal_work_futex.store(0, std::memory_order_release);
+            /* Re-check after clearing the flag to avoid lost wake-ups */
+            if (state->signal_work_queue.pop(work)) {
+                nvshmemt_libfabric_gdr_process_amo(transport, work.op, work.send_elems,
+                                                   work.sequence_count);
+            } else {
+                nvshmemt_libfabric_futex_wait(&state->signal_work_futex);
+            }
         }
     }
     return NULL;
@@ -852,6 +873,7 @@ static int nvshmemt_libfabric_gdr_process_amos(nvshmem_transport_t transport, in
                        thread can consume work_queue and make space. */
                     nvshmemt_libfabric_gdr_complete_amos(transport);
                 }
+                nvshmemt_libfabric_futex_wake(&libfabric_state->signal_work_futex);
             }
         } while (op && ops_processed < libfabric_state->proxy_request_batch_max);
     }
@@ -2316,6 +2338,7 @@ static int nvshmemt_libfabric_finalize(nvshmem_transport_t transport) {
     /* Stop signal delivery thread before tearing down resources */
     if (use_staged_atomics && libfabric_state->signal_delivery_transport) {
         libfabric_state->signal_delivery_stop.store(1, std::memory_order_relaxed);
+        nvshmemt_libfabric_futex_wake(&libfabric_state->signal_work_futex);
         pthread_join(libfabric_state->signal_delivery_thread, NULL);
     }
 
