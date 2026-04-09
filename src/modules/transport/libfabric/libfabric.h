@@ -7,6 +7,7 @@
 #include <assert.h>
 #include <stdint.h>  // IWYU pragma: keep
 #include <stdio.h>
+#include <cstdlib>
 #include <stddef.h>
 #include <string.h>
 #include <atomic>
@@ -510,6 +511,44 @@ class threadSafeOpQueue {
     }
 };
 
+/**
+ * Per-PE flat array + overflow map for signal completion entries.
+ * Fast path: O(1) direct index by (seq % WINDOW). Covers normal operation.
+ * Slow path: falls back to std::unordered_map on slot collision (different seq
+ * maps to same slot). This only happens if a single PE has >WINDOW concurrent
+ * unmatched entries.
+ */
+struct signal_seq_map {
+    static constexpr int WINDOW = 64;
+    struct slot { nvshmemt_libfabric_comp_entry_t entry; uint32_t seq; bool occupied; };
+    slot slots[WINDOW] = {};
+    std::unordered_map<uint32_t, nvshmemt_libfabric_comp_entry_t> overflow;
+
+    nvshmemt_libfabric_comp_entry_t *find(uint32_t seq) {
+        slot *s = &slots[seq % WINDOW];
+        if (s->occupied && s->seq == seq) return &s->entry;
+        auto it = overflow.find(seq);
+        return (it != overflow.end()) ? &it->second : nullptr;
+    }
+
+    void insert(uint32_t seq, const nvshmemt_libfabric_comp_entry_t &e) {
+        slot *s = &slots[seq % WINDOW];
+        if (!s->occupied) {
+            s->entry = e; s->seq = seq; s->occupied = true;
+        } else if (s->seq != seq) {
+            overflow[seq] = e;
+        } else {
+            assert(false && "signal_seq_map: duplicate insert");
+        }
+    }
+
+    void erase(uint32_t seq) {
+        slot *s = &slots[seq % WINDOW];
+        if (s->occupied && s->seq == seq) s->occupied = false;
+        else overflow.erase(seq);
+    }
+};
+
 /*
  * Each index of the vectors contain a domain-specific resource. Host domain resources are first,
  * proceeded by proxy domain resources. The number of each domain type is specified by
@@ -521,9 +560,9 @@ class threadSafeOpQueue {
  * of an endpoint is stored directly in nvshmemt_libfabric_endpoint_t (domain_index).
  */
 typedef struct {
-    std::unordered_map<int, nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
-    std::unordered_map<uint64_t, nvshmemt_libfabric_comp_entry_t> *proxy_put_signal_comp_map;
-    std::unordered_map<int, uint32_t> *next_expected_seq;
+    std::vector<nvshmemt_libfabric_endpoint_seq_counter_t> *put_signal_seq_counter_per_pe;
+    std::vector<signal_seq_map> *proxy_put_signal_comp_map;
+    std::vector<uint32_t> *next_expected_seq;
 } nvshmemt_libfabric_signal_state_t;
 
 typedef struct {
