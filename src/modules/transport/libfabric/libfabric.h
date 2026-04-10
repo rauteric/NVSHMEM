@@ -268,8 +268,7 @@ typedef enum {
     NVSHMEMT_LIBFABRIC_ACK,
     NVSHMEMT_LIBFABRIC_MATCH,
     NVSHMEMT_LIBFABRIC_RMA,
-    NVSHMEMT_LIBFABRIC_SIGNAL_ACK_WRITE,
-    NVSHMEMT_LIBFABRIC_AMO_ACK_WRITE,
+    NVSHMEMT_LIBFABRIC_AMO_ACK_SEND,
 } nvshmemt_libfabric_recv_t;
 
 typedef enum {
@@ -657,9 +656,6 @@ typedef struct {
     std::vector<void *> send_buf;
     std::vector<void *> recv_buf;
     std::vector<struct fid_mr *> mrs;
-    std::vector<struct fid_mr *> mr_staged_amo_acks;
-    void **remote_addr_staged_amo_ack;
-    uint64_t *rkey_staged_amo_ack;
 
     /* Signal ordering state */
     nvshmemt_libfabric_signal_state_t host_signal_state;
@@ -732,3 +728,14 @@ typedef struct nvshmemt_libfabric_gdr_signal_op {
 } nvshmemt_libfabric_gdr_signal_op_t;
 /*  EFA's inline send size is 32 bytes */
 static_assert(sizeof(nvshmemt_libfabric_gdr_signal_op_t) == 32);
+
+/* Wire data for AMO ack sent via fi_send
+ * | 4 type | 4 ack_header | 4 sequence_count |
+ */
+typedef struct nvshmemt_libfabric_gdr_amo_ack_op {
+    nvshmemt_libfabric_recv_t type; /* Must be first */
+    nvshmemt_libfabric_imm_cq_data_hdr_t ack_header;
+    uint32_t sequence_count;
+} nvshmemt_libfabric_gdr_amo_ack_op_t;
+static_assert(sizeof(nvshmemt_libfabric_gdr_amo_ack_op_t) <= 32,
+              "Must fit within EFA's inline send limit of 32 bytes");

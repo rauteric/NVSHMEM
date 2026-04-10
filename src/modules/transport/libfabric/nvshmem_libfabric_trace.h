@@ -70,7 +70,7 @@ LTTNG_UST_TRACEPOINT_EVENT(nvshmem_libfabric, write_remote_completion,
 
 /* ========================================================================
  * FI_RMA completions (local fi_writedata completed)
- * type: RMA(3)=sender put, SIGNAL_ACK_WRITE(4), AMO_ACK_WRITE(5)=receiver ack
+ * type: RMA(3)=sender put, AMO_ACK_SEND(4)=receiver ack
  * ======================================================================== */
 
 LTTNG_UST_TRACEPOINT_EVENT(nvshmem_libfabric, write_completion,
