@@ -70,7 +70,7 @@ LTTNG_UST_TRACEPOINT_EVENT(nvshmem_libfabric, write_remote_completion,
 
 /* ========================================================================
  * FI_RMA completions (local fi_writedata completed)
- * type: RMA(3)=sender put, SIGNAL_ACK_WRITE(4), AMO_ACK_WRITE(5)=receiver ack
+ * type: RMA(3)=sender put
  * ======================================================================== */
 
 LTTNG_UST_TRACEPOINT_EVENT(nvshmem_libfabric, write_completion,
@@ -84,7 +84,8 @@ LTTNG_UST_TRACEPOINT_EVENT(nvshmem_libfabric, write_completion,
 
 /* ========================================================================
  * FI_SEND completions (local fi_send completed)
- * type: SEND(0)=sender AMO, ACK(1)=receiver AMO response, MATCH(2)=sender signal
+ * type: SEND(0)=sender AMO, ACK(1)=receiver AMO response, MATCH(2)=sender signal,
+ *       AMO_ACK_SEND(3)=AMO ack send
  * ======================================================================== */
 
 LTTNG_UST_TRACEPOINT_EVENT(nvshmem_libfabric, send_completion,
@@ -98,7 +99,8 @@ LTTNG_UST_TRACEPOINT_EVENT(nvshmem_libfabric, send_completion,
 
 /* ========================================================================
  * FI_RECV completions (remote fi_send arrived)
- * type: SEND(0)=AMO at receiver, ACK(1)=AMO response at sender, MATCH(2)=signal at receiver
+ * type: SEND(0)=AMO at receiver, ACK(1)=AMO response at sender, MATCH(2)=signal at receiver,
+ *       AMO_ACK_SEND(3)=AMO ack receive at sender
  * ======================================================================== */
 
 LTTNG_UST_TRACEPOINT_EVENT(nvshmem_libfabric, recv_completion,
