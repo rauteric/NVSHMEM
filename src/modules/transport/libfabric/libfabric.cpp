@@ -491,11 +491,11 @@ static void nvshmemt_libfabric_put_signal_ack_completion(nvshmemt_libfabric_stat
                                                          fi_addr_t addr) {
     uint32_t seq_num = ack_op->sequence_count;
 
-    if (seq_num != NVSHMEM_STAGED_AMO_SEQ_NUM) {
-        /* Use host_signal_state for eps[0], proxy_signal_state for eps[1+] */
-        nvshmemt_libfabric_signal_state_t *signal_state =
-            (ep.domain_index == 0) ? &state->host_signal_state : &state->proxy_signal_state;
+    /* Use host_signal_state for eps[0], proxy_signal_state for eps[1+] */
+    nvshmemt_libfabric_signal_state_t *signal_state =
+        (ep.domain_index == 0) ? &state->host_signal_state : &state->proxy_signal_state;
 
+    if (seq_num != NVSHMEM_STAGED_AMO_SEQ_NUM) {
         int pe = convert_addr_to_pe(state, &ep, addr);
         auto &seq_counter = signal_state->put_signal_seq_counter_per_pe[pe];
 
@@ -515,7 +515,7 @@ static void nvshmemt_libfabric_put_signal_ack_completion(nvshmemt_libfabric_stat
         }
     }
 
-    ep.completed_staged_atomics++;
+    signal_state->completed_staged_atomics++;
 }
 
 static inline bool is_signal_only_op(nvshmemi_amo_t op) {
@@ -1063,6 +1063,7 @@ static int nvshmemt_libfabric_quiet(struct nvshmem_transport *tcurr, int pe, int
     nvshmemt_libfabric_state_t *libfabric_state = (nvshmemt_libfabric_state_t *)tcurr->state;
     int ep_start_idx;
     int ep_end_idx;
+    uint64_t completed;
     int status = 0;
     bool all_quieted;
 
@@ -1074,19 +1075,27 @@ static int nvshmemt_libfabric_quiet(struct nvshmem_transport *tcurr, int pe, int
         ep_end_idx = libfabric_state->eps.size();
     }
 
+    nvshmemt_libfabric_signal_state_t *signal_state =
+        (qp_index == NVSHMEMX_QP_HOST) ? &libfabric_state->host_signal_state
+                                       : &libfabric_state->proxy_signal_state;
+
     for (;;) {
-        all_quieted = true;
+        uint64_t total_submitted = 0;
+        uint64_t total_completed = 0;
         for (int i = ep_start_idx; i < ep_end_idx; i++) {
-            nvshmemt_libfabric_endpoint_t &ep = *(libfabric_state->eps[i]);
-            if (ep.submitted_ops != ep.completed_ops + ep.completed_staged_atomics) {
-                all_quieted = false;
-                if (nvshmemt_libfabric_progress(tcurr, qp_index)) {
-                    status = NVSHMEMX_ERROR_INTERNAL;
-                    break;
-                }
-            }
+            total_submitted += libfabric_state->eps[i]->submitted_ops;
+            total_completed += libfabric_state->eps[i]->completed_ops;
         }
-        if (status || all_quieted) break;
+
+        total_completed += signal_state->completed_staged_atomics;
+        if (total_submitted == total_completed) {
+            break;
+        }
+
+        if (nvshmemt_libfabric_progress(tcurr, qp_index)) {
+            status = NVSHMEMX_ERROR_INTERNAL;
+            break;
+        }
     }
 
     return status;
@@ -2103,9 +2112,11 @@ static int nvshmemt_libfabric_connect_endpoints(nvshmem_transport_t t, int *sele
         state->host_signal_state.put_signal_seq_counter_per_pe.resize(npes);
         state->host_signal_state.proxy_put_signal_comp_map.resize(npes);
         state->host_signal_state.next_expected_seq.resize(npes, 0);
+        state->host_signal_state.completed_staged_atomics = 0;
         state->proxy_signal_state.put_signal_seq_counter_per_pe.resize(npes);
         state->proxy_signal_state.proxy_put_signal_comp_map.resize(npes);
         state->proxy_signal_state.next_expected_seq.resize(npes, 0);
+        state->proxy_signal_state.completed_staged_atomics = 0;
     }
 
     for (size_t i = 0; i < state->prov_infos.size(); i++) {
@@ -2170,7 +2181,6 @@ static int nvshmemt_libfabric_connect_endpoints(nvshmem_transport_t t, int *sele
         state->eps[i]->ep_index = i;
         state->eps[i]->qp_index = i;
 
-        state->eps[i]->completed_staged_atomics = 0;
         state->eps[i]->submitted_ops = 0;
         state->eps[i]->completed_ops = 0;
 
