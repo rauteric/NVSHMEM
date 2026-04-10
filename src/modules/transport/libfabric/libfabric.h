@@ -283,7 +283,6 @@ typedef struct {
     struct fid_cntr *counter;
     uint64_t submitted_ops;
     uint64_t completed_ops;
-    uint64_t completed_staged_atomics;
     int domain_index;
     int ep_index;
     int qp_index;
@@ -581,6 +580,7 @@ typedef struct {
     std::vector<nvshmemt_libfabric_endpoint_seq_counter_t> put_signal_seq_counter_per_pe;
     std::vector<signal_seq_map> proxy_put_signal_comp_map;
     std::vector<uint32_t> next_expected_seq;
+    uint64_t completed_staged_atomics;
 } nvshmemt_libfabric_signal_state_t;
 
 struct signal_delivery_work_entry {
