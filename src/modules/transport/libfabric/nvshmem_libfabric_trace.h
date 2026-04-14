@@ -138,12 +138,12 @@ LTTNG_UST_TRACEPOINT_EVENT(nvshmem_libfabric, receiver_gdrcopy_end,
  * ======================================================================== */
 
 LTTNG_UST_TRACEPOINT_EVENT(nvshmem_libfabric, receiver_post_ack,
-    LTTNG_UST_TP_ARGS(int, pe, int, domain_index, uint32_t, sequence_count, int, ack_header),
+    LTTNG_UST_TP_ARGS(int, pe, int, domain_index, uint32_t, sequence_count, int, ack_type),
     LTTNG_UST_TP_FIELDS(
         lttng_ust_field_integer(int, pe, pe)
         lttng_ust_field_integer(int, domain_index, domain_index)
         lttng_ust_field_integer(uint32_t, sequence_count, sequence_count)
-        lttng_ust_field_integer(int, ack_header, ack_header)
+        lttng_ust_field_integer(int, ack_type, ack_type)
     )
 )
 

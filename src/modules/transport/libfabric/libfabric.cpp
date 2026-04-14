@@ -109,7 +109,7 @@ static inline int try_again(nvshmem_transport_t transport, int *status, uint64_t
 int gdrcopy_amo_ack(nvshmem_transport_t transport, nvshmemt_libfabric_endpoint_t &ep,
                     fi_addr_t dest_addr, uint32_t sequence_count, int pe,
                     nvshmemt_libfabric_gdr_op_ctx_t **send_elems,
-                    nvshmemt_libfabric_imm_cq_data_hdr_t ack_header);
+                    nvshmemt_libfabric_ack_t ack_type);
 
 /* Internal global variables */
 #ifdef NVSHMEM_USE_GDRCOPY
@@ -248,7 +248,7 @@ static inline int get_next_seq_num_with_retry(nvshmem_transport_t transport,
 int gdrcopy_amo_ack(nvshmem_transport_t transport, nvshmemt_libfabric_endpoint_t &ep,
                     fi_addr_t dest_addr, uint32_t sequence_count, int pe,
                     nvshmemt_libfabric_gdr_op_ctx_t **send_elems,
-                    nvshmemt_libfabric_imm_cq_data_hdr_t ack_header) {
+                    nvshmemt_libfabric_ack_t ack_type) {
     nvshmemt_libfabric_state_t *libfabric_state = (nvshmemt_libfabric_state_t *)transport->state;
     nvshmemt_libfabric_gdr_op_ctx_t *resp_op = NULL;
     uint64_t num_retries = 0;
@@ -257,7 +257,7 @@ int gdrcopy_amo_ack(nvshmem_transport_t transport, nvshmemt_libfabric_endpoint_t
     resp_op = send_elems[0];
     nvshmemt_libfabric_gdr_amo_ack_op_t *ack_op = (nvshmemt_libfabric_gdr_amo_ack_op_t *)resp_op;
     ack_op->type = NVSHMEMT_LIBFABRIC_AMO_ACK_SEND;
-    ack_op->ack_header = ack_header;
+    ack_op->ack_type = ack_type;
     ack_op->sequence_count = sequence_count;
     do {
         status = fi_send(ep.endpoint, (void *)ack_op, sizeof(nvshmemt_libfabric_gdr_amo_ack_op_t),
@@ -268,7 +268,7 @@ int gdrcopy_amo_ack(nvshmem_transport_t transport, nvshmemt_libfabric_endpoint_t
 
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "Unable to send atomic ack.\n");
     ep.submitted_ops++;
-    NVSHMEM_TRACE_RECEIVER_POST_ACK(pe, ep.domain_index, sequence_count, ack_header);
+    NVSHMEM_TRACE_RECEIVER_POST_ACK(pe, ep.domain_index, sequence_count, ack_type);
 
 out:
     return status;
@@ -489,7 +489,7 @@ static void nvshmemt_libfabric_put_signal_ack_completion(nvshmemt_libfabric_stat
 
         int pe = convert_addr_to_pe(state, &ep, addr);
 
-        if (ack_op->ack_header == NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_ACK) {
+        if (ack_op->ack_type == NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_ACK) {
             signal_state->put_signal_seq_counter_per_pe[pe]
                 .return_acked_seq_num_range_for_put(seq_num);
         } else {
