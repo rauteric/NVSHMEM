@@ -498,6 +498,7 @@ int nvshmemt_libfabric_ack_aggregator::flush_peer(
 
     /* Build coalesced ack payload in send element buffer */
     ack = reinterpret_cast<nvshmemt_libfabric_gdr_amo_ack_op_t *>(send_elem);
+    ack->type = NVSHMEMT_LIBFABRIC_AMO_ACK_SEND;
     ack->ack_type = NVSHMEMT_LIBFABRIC_MSG_COALESCED_ACK;
     ack->src_pe = transport->my_pe;
     ack->range_start = pending.has_range ? pending.range_start : 0;
@@ -619,6 +620,29 @@ static void nvshmemt_libfabric_put_signal_ack_completion(nvshmemt_libfabric_stat
                                                          nvshmemt_libfabric_endpoint_t &ep,
                                                          nvshmemt_libfabric_gdr_amo_ack_op_t *ack_op,
                                                          fi_addr_t addr) {
+    /* Check for coalesced ack message (fi_send payload with MSG_COALESCED_ACK header) */
+    if (ack_op->ack_type == NVSHMEMT_LIBFABRIC_MSG_COALESCED_ACK) {
+        nvshmemt_libfabric_signal_state_t *signal_state =
+            (ep.ep_index == 0) ? &state->host_signal_state
+                                    : &state->proxy_signal_state;
+
+        if (ack_op->range_count > 0) {
+            uint32_t end_seq =
+                (ack_op->range_start + ack_op->range_count - 1) &
+                nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
+            signal_state->put_signal_seq_counter_per_pe[ack_op->src_pe]
+                .return_acked_seq_num_range(ack_op->range_start, end_seq);
+        }
+        if (ack_op->amo_ack_count > 0) {
+            signal_state->completed_staged_atomics += ack_op->amo_ack_count;
+        }
+        if (ack_op->range_count > 0) {
+            signal_state->completed_staged_atomics += ack_op->range_count;
+        }
+
+        return;
+    }
+
     uint32_t seq_num = ack_op->sequence_count;
 
     /* Use host_signal_state for eps[0], proxy_signal_state for eps[1+] */
@@ -724,35 +748,6 @@ static int nvshmemt_libfabric_gdr_process_completion(nvshmem_transport_t transpo
         NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
                             "Unable to re-post recv.\n");
     } else if (entry->flags & FI_RECV) {
-        /* Check for coalesced ack message (fi_send payload with MSG_COALESCED_ACK header) */
-        nvshmemt_libfabric_gdr_amo_ack_op_t *coal_ack =
-            reinterpret_cast<nvshmemt_libfabric_gdr_amo_ack_op_t *>(op);
-        if (coal_ack->ack_type == NVSHMEMT_LIBFABRIC_MSG_COALESCED_ACK) {
-            nvshmemt_libfabric_signal_state_t *signal_state =
-                (ep.ep_index == 0) ? &state->host_signal_state
-                                        : &state->proxy_signal_state;
-
-            if (coal_ack->range_count > 0) {
-                uint32_t end_seq =
-                    (coal_ack->range_start + coal_ack->range_count - 1) &
-                    nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
-                signal_state->put_signal_seq_counter_per_pe[coal_ack->src_pe]
-                    .return_acked_seq_num_range(coal_ack->range_start, end_seq);
-            }
-            if (coal_ack->amo_ack_count > 0) {
-                signal_state->completed_staged_atomics += coal_ack->amo_ack_count;
-            }
-            if (coal_ack->range_count > 0) {
-                signal_state->completed_staged_atomics += coal_ack->range_count;
-            }
-
-            /* Re-post recv buffer */
-            status = fi_recv(ep.endpoint, (void *)op, NVSHMEM_STAGED_AMO_WIREDATA_SIZE,
-                            fi_mr_desc(state->mrs[domain_idx]), FI_ADDR_UNSPEC, &op->ofi_context);
-            NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
-                                   "Unable to re-post recv for coalesced ack.\n");
-            goto out;
-        }
         op->ep_index = ep.ep_index;
         if (op->type == NVSHMEMT_LIBFABRIC_ACK) {
             status = nvshmemt_libfabric_gdr_process_ack(transport, op);
