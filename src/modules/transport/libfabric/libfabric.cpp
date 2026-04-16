@@ -488,13 +488,15 @@ static void nvshmemt_libfabric_put_signal_ack_completion(nvshmemt_libfabric_stat
             (ep.domain_index == 0) ? &state->host_signal_state : &state->proxy_signal_state;
 
         int pe = convert_addr_to_pe(state, &ep, addr);
+        auto &seq_counter = signal_state->put_signal_seq_counter_per_pe[pe];
 
         if (ack_op->ack_type == NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_ACK) {
-            signal_state->put_signal_seq_counter_per_pe[pe]
-                .return_acked_seq_num_range_for_put(seq_num);
+            assert(ack_op->put_count == NVSHMEM_STAGED_AMO_PUT_ACK_FREQ);
+            /* Put ACK: decrement by the put batch count */
+            seq_counter.return_acked_range(seq_num, NVSHMEM_STAGED_AMO_PUT_ACK_FREQ);
         } else {
-            signal_state->put_signal_seq_counter_per_pe[pe]
-                .return_acked_seq_num(seq_num);
+            /* Signal/AMO ACK: decrement preceding puts (TODO) + the signal itself */
+            seq_counter.return_acked_range(seq_num, 1);
         }
     }
 
