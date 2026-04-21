@@ -526,6 +526,7 @@ void nvshmemt_libfabric_ack_aggregator::record_ack(
 
     auto &pending = pending_per_peer[pe];
     bool was_empty = (pending.total_pending() == 0);
+    pending.age = 0;
 
     uint32_t start_seq_num = (seq_num - preceding_put_count) &
         nvshmemt_libfabric_endpoint_seq_counter_t::sequence_mask;
@@ -582,6 +583,7 @@ void nvshmemt_libfabric_ack_aggregator::record_amo_ack(
     nvshmemt_libfabric_endpoint_t *ep, fi_addr_t dest_addr) {
     auto &pending = pending_per_peer[pe];
     bool was_empty = (pending.total_pending() == 0);
+    pending.age = 0;
 
     pending.amo_ack_count++;
 
@@ -614,6 +616,60 @@ int nvshmemt_libfabric_ack_aggregator::flush_all(
     }
     dirty_peers.clear();
     return status;
+}
+
+int nvshmemt_libfabric_ack_aggregator::flush_stale(
+    nvshmem_transport_t transport, nvshmemt_libfabric_endpoint_t *ep) {
+    nvshmemt_libfabric_state_t *libfabric_state =
+        (nvshmemt_libfabric_state_t *)transport->state;
+    int status = 0;
+
+    for (size_t i = 0; i < dirty_peers.size(); ) {
+        int pe = dirty_peers[i];
+        auto &pending = pending_per_peer[pe];
+        pending.age++;
+        if (pending.age >= NVSHMEMT_LIBFABRIC_ACK_MAX_AGE) {
+            fi_addr_t dest_addr = pe * libfabric_state->eps.size() + ep->ep_index;
+            status = flush_peer(pe, transport, ep, dest_addr);
+            if (status) return status;
+            /* flush_peer clears pending; remove from dirty_peers (swap-and-pop) */
+            dirty_peers[i] = dirty_peers.back();
+            dirty_peers.pop_back();
+        } else {
+            i++;
+        }
+    }
+    return 0;
+}
+
+bool nvshmemt_libfabric_ack_aggregator::try_extract_for_peer(
+    int pe, uint32_t &range_end, uint32_t &range_count, uint32_t &signal_ack_count) {
+    auto it = pending_per_peer.find(pe);
+    if (it == pending_per_peer.end() || it->second.total_pending() == 0)
+        return false;
+
+    auto &pending = it->second;
+    range_end = pending.range_end;
+    range_count = pending.range_count;
+    signal_ack_count = pending.signal_ack_count + pending.amo_ack_count;
+
+    /* Clear pending state */
+    pending.range_end = 0;
+    pending.range_count = 0;
+    pending.has_range = false;
+    pending.amo_ack_count = 0;
+    pending.signal_ack_count = 0;
+    pending.age = 0;
+
+    /* Remove from dirty_peers */
+    for (size_t i = 0; i < dirty_peers.size(); i++) {
+        if (dirty_peers[i] == pe) {
+            dirty_peers[i] = dirty_peers.back();
+            dirty_peers.pop_back();
+            break;
+        }
+    }
+    return true;
 }
 
 /* Private functions with external linkage (local symbols) */
@@ -910,10 +966,10 @@ static int nvshmemt_libfabric_progress(nvshmem_transport_t transport, int qp_ind
             return NVSHMEMX_ERROR_INTERNAL;
         }
 
-        /* Flush any remaining coalesced acks at end of progress cycle */
+        /* Flush stale coalesced acks (age >= NVSHMEMT_LIBFABRIC_ACK_MAX_AGE) */
         if (progress_qp_index == NVSHMEMX_QP_HOST || progress_qp_index == NVSHMEMX_QP_ALL) {
             if (libfabric_state->host_signal_state.ack_aggregator) {
-                status = libfabric_state->host_signal_state.ack_aggregator->flush_all(
+                status = libfabric_state->host_signal_state.ack_aggregator->flush_stale(
                     transport, libfabric_state->eps[0].get());
                 if (status) {
                     libfabric_state->signal_progress_lock.clear(std::memory_order_release);
@@ -924,7 +980,7 @@ static int nvshmemt_libfabric_progress(nvshmem_transport_t transport, int qp_ind
         if (progress_qp_index != NVSHMEMX_QP_HOST) {
             if (libfabric_state->proxy_signal_state.ack_aggregator &&
                 libfabric_state->eps.size() > libfabric_state->num_host_domains) {
-                status = libfabric_state->proxy_signal_state.ack_aggregator->flush_all(
+                status = libfabric_state->proxy_signal_state.ack_aggregator->flush_stale(
                     transport, libfabric_state->eps[libfabric_state->num_host_domains].get());
                 if (status) {
                     libfabric_state->signal_progress_lock.clear(std::memory_order_release);
@@ -1098,6 +1154,11 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
         map_seq = sig_op->sequence_count;
         progress_count = (int)sig_op->num_writes;
 
+        /* Extract piggybacked ACK fields before in-place copy overwrites them */
+        uint16_t piggyback_ack_seq = sig_op->ack_seq_num;
+        uint8_t piggyback_ack_count = sig_op->ack_count;
+        uint8_t piggyback_ack_ops = sig_op->ack_num_ops;
+
         /* The EFA provider has an inline send size of 32 bytes.
          * The gdr atomic fi_send message is 72 bytes and does not
          * fit inside the efa_provider's 32 byte inline send window.
@@ -1106,6 +1167,13 @@ static int nvshmemt_libfabric_put_signal_completion(nvshmem_transport_t transpor
          * code.
          */
         op = inplace_copy_sig_op_to_gdr_op(sig_op, ep.ep_index);
+
+        /* Apply piggybacked ACK: credit the local sender's sequence counter */
+        if (piggyback_ack_count > 0) {
+            auto &seq_counter = signal_state->put_signal_seq_counter_per_pe[pe];
+            seq_counter.return_acked_range(piggyback_ack_seq, piggyback_ack_count);
+            signal_state->completed_staged_atomics += piggyback_ack_ops;
+        }
     }
 
     if (is_write_comp && get_write_with_imm_hdr(entry->data) == NVSHMEMT_LIBFABRIC_IMM_STANDALONE_PUT_WITH_ACK_REQ) {
@@ -1222,6 +1290,12 @@ static int nvshmemt_libfabric_quiet(struct nvshmem_transport *tcurr, int pe, int
     auto quiet_start = std::chrono::steady_clock::now();
     bool warned = false;
     for (;;) {
+        /* Force-flush all pending ACKs so they get sent before checking quiescence */
+        if (signal_state->ack_aggregator) {
+            int ep_idx = (qp_index == NVSHMEMX_QP_HOST) ? 0 : libfabric_state->num_host_domains;
+            signal_state->ack_aggregator->flush_all(tcurr, libfabric_state->eps[ep_idx].get());
+        }
+
         uint64_t total_submitted = 0;
         uint64_t total_completed = 0;
         for (int i = ep_start_idx; i < ep_end_idx; i++) {
@@ -1709,7 +1783,26 @@ static int nvshmemt_libfabric_gdr_signal(struct nvshmem_transport *transport, in
     signal->num_writes = num_writes;
     signal->src_pe = transport->my_pe;
     signal->preceding_put_count = preceding_put_count;
-    signal->reserved = 0;
+
+    /* Piggyback pending ACK for this destination PE if available */
+    {
+        nvshmemt_libfabric_signal_state_t *signal_state =
+            (qp_index == NVSHMEMX_QP_HOST) ? &libfabric_state->host_signal_state
+                                            : &libfabric_state->proxy_signal_state;
+        uint32_t ack_range_end, ack_range_count, ack_signal_count;
+        if (signal_state->ack_aggregator &&
+            signal_state->ack_aggregator->try_extract_for_peer(
+                pe, ack_range_end, ack_range_count, ack_signal_count)) {
+            signal->ack_seq_num = (uint16_t)ack_range_end;
+            signal->ack_count = (uint8_t)ack_range_count;
+            signal->ack_num_ops = (uint8_t)ack_signal_count;
+        } else {
+            signal->ack_seq_num = 0;
+            signal->ack_count = 0;
+            signal->ack_num_ops = 0;
+        }
+        signal->reserved = 0;
+    }
 
     NVSHMEM_TRACE_SENDER_POST_SIGNAL(pe, ep.domain_index, sequence_count, num_writes);
 
