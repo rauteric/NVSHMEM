@@ -2266,12 +2266,12 @@ static int nvshmemt_libfabric_connect_endpoints(nvshmem_transport_t t, int *sele
         state->host_signal_state.put_signal_seq_counter_per_pe.resize(npes);
         state->host_signal_state.proxy_put_signal_comp_map.resize(npes);
         state->host_signal_state.next_expected_seq.resize(npes, 0);
-        state->host_signal_state.ack_aggregator = new nvshmemt_libfabric_ack_aggregator_t();
+        state->host_signal_state.ack_aggregator = new nvshmemt_libfabric_ack_aggregator_t(npes);
         state->host_signal_state.completed_staged_atomics = 0;
         state->proxy_signal_state.put_signal_seq_counter_per_pe.resize(npes);
         state->proxy_signal_state.proxy_put_signal_comp_map.resize(npes);
         state->proxy_signal_state.next_expected_seq.resize(npes, 0);
-        state->proxy_signal_state.ack_aggregator = new nvshmemt_libfabric_ack_aggregator_t();
+        state->proxy_signal_state.ack_aggregator = new nvshmemt_libfabric_ack_aggregator_t(npes);
         state->proxy_signal_state.completed_staged_atomics = 0;
     }
 

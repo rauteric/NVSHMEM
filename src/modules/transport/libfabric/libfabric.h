@@ -769,11 +769,11 @@ typedef struct nvshmem_transport *nvshmem_transport_t;
 
 /* Ack aggregator: accumulates signal/AMO acks per peer, flushes as coalesced fi_send */
 struct nvshmemt_libfabric_ack_aggregator {
-    std::unordered_map<int, nvshmemt_libfabric_peer_pending_acks_t> pending_per_peer;
+    std::vector<nvshmemt_libfabric_peer_pending_acks_t> pending_per_peer;
     std::vector<int> dirty_peers;
     uint32_t flush_threshold;
 
-    nvshmemt_libfabric_ack_aggregator() : flush_threshold(16) {}
+    nvshmemt_libfabric_ack_aggregator(int npes) : pending_per_peer(npes), flush_threshold(16) {}
 
     void record_ack(int pe, uint32_t seq_num, nvshmem_transport_t transport,
                     nvshmemt_libfabric_endpoint_t *ep, fi_addr_t dest_addr,
