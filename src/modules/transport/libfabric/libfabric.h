@@ -706,21 +706,24 @@ static_assert(sizeof(nvshmemt_libfabric_mem_handle_t) <= nvshmemt_libfabric_mem_
 
 /* Wire data for put-signal gdr staged atomics
  * 32 bytes
- * | 1 type | 3 reserved | 1 op | 1 elem_size | 2 num_writes | 8 signal | 8 target_addr | 2 sequence_count
- * | 1 preceding_put_count | 1 reserved | 4 src_pe
+ * | 1 type | 1 op | 1 elem_size | 1 preceding_put_count | 2 num_writes | 2 src_pe
+ * | 8 sig_val | 8 target_addr
+ * | 2 sequence_count | 2 ack_seq_num | 1 ack_count | 1 ack_num_ops | 2 reserved
  */
 typedef struct nvshmemt_libfabric_gdr_signal_op {
-    uint8_t type; /* nvshmemt_libfabric_recv_t — must be first */
-    uint8_t reserved1[3];
-    uint8_t op;
-    uint8_t elem_size;
-    uint16_t num_writes;
-    uint64_t sig_val;
-    void *target_addr;
-    uint16_t sequence_count;
+    uint8_t  type; /* nvshmemt_libfabric_recv_t — must be first */
+    uint8_t  op;
+    uint8_t  elem_size;
     uint8_t  preceding_put_count;
-    uint8_t  reserved;
-    uint32_t src_pe;
+    uint16_t num_writes;
+    uint16_t src_pe;
+    uint64_t sig_val;
+    void    *target_addr;
+    uint16_t sequence_count;
+    uint16_t ack_seq_num;       /* Piggybacked ACK: range_end seq num */
+    uint8_t  ack_count;         /* Piggybacked ACK: range_count (seq nums to free) */
+    uint8_t  ack_num_ops;       /* Piggybacked ACK: num_ack_ops (for completed_staged_atomics) */
+    uint16_t reserved;
 } nvshmemt_libfabric_gdr_signal_op_t;
 /*  EFA's inline send size is 32 bytes */
 static_assert(sizeof(nvshmemt_libfabric_gdr_signal_op_t) == 32);
