@@ -325,7 +325,7 @@ typedef struct nvshmemt_libfabric_gdr_ret_amo_op {
 } nvshmemt_libfabric_gdr_ret_amo_op_t;
 
 struct nvshmemt_libfabric_gdr_op_ctx {
-    nvshmemt_libfabric_recv_t type;
+    uint8_t type; /* nvshmemt_libfabric_recv_t */
     int ep_index;
     union {
         nvshmemt_libfabric_gdr_send_p_op_t p_op;
@@ -706,20 +706,24 @@ static_assert(sizeof(nvshmemt_libfabric_mem_handle_t) <= nvshmemt_libfabric_mem_
 
 /* Wire data for put-signal gdr staged atomics
  * 32 bytes
- * | 4 type | 1 op | 1 elem_size | 2 num_writes | 8 signal | 8 target_addr | 2 sequence_count
- * | 1 preceding_put_count | 1 reserved | 4 src_pe
+ * | 1 type | 1 op | 1 elem_size | 1 preceding_put_count | 2 num_writes | 2 src_pe
+ * | 8 sig_val | 8 target_addr
+ * | 2 sequence_count | 2 ack_seq_num | 1 ack_count | 1 ack_num_ops | 2 reserved
  */
 typedef struct nvshmemt_libfabric_gdr_signal_op {
-    nvshmemt_libfabric_recv_t type; /* Must be first */
-    uint8_t op;
-    uint8_t elem_size;
-    uint16_t num_writes;
-    uint64_t sig_val;
-    void *target_addr;
-    uint16_t sequence_count;
+    uint8_t  type; /* nvshmemt_libfabric_recv_t — must be first */
+    uint8_t  op;
+    uint8_t  elem_size;
     uint8_t  preceding_put_count;
-    uint8_t  reserved;
-    uint32_t src_pe;
+    uint16_t num_writes;
+    uint16_t src_pe;
+    uint64_t sig_val;
+    void    *target_addr;
+    uint16_t sequence_count;
+    uint16_t ack_seq_num;       /* Piggybacked ACK: range_end seq num */
+    uint8_t  ack_count;         /* Piggybacked ACK: range_count (seq nums to free) */
+    uint8_t  ack_num_ops;       /* Piggybacked ACK: num_ack_ops (for completed_staged_atomics) */
+    uint16_t reserved;
 } nvshmemt_libfabric_gdr_signal_op_t;
 /*  EFA's inline send size is 32 bytes */
 static_assert(sizeof(nvshmemt_libfabric_gdr_signal_op_t) == 32);
@@ -729,11 +733,11 @@ static_assert(sizeof(nvshmemt_libfabric_gdr_signal_op_t) <=
               "Must fit within nvshmemt_libfabric_gdr_op_ctx_t");
 
 /* Wire data for AMO ack sent via fi_send
- * | 4 type | 4 range_end | 4 range_count | 4 amo_ack_count | 4 num_ack_ops
+ * | 1 type | (3 pad) | 4 range_end | 4 range_count | 4 amo_ack_count | 4 num_ack_ops
  * | 1 put_count |
  */
 typedef struct nvshmemt_libfabric_gdr_amo_ack_op {
-    nvshmemt_libfabric_recv_t type; /* Must be first */
+    uint8_t type; /* nvshmemt_libfabric_recv_t — must be first */
     uint32_t range_end;     /* End (last seq num) of signal sequence number range */
     uint32_t range_count;   /* Count of acked sequence numbers */
     uint32_t amo_ack_count; /* Count of AMO acks (NVSHMEM_STAGED_AMO_SEQ_NUM) */
@@ -747,6 +751,8 @@ static_assert(sizeof(nvshmemt_libfabric_gdr_amo_ack_op) <=
               offsetof(nvshmemt_libfabric_gdr_op_ctx_t, ofi_context),
               "Must fit within nvshmemt_libfabric_gdr_op_ctx_t");
 
+#define NVSHMEMT_LIBFABRIC_ACK_MAX_AGE 64
+
 /* Per-peer pending ack state for the ack aggregator */
 struct nvshmemt_libfabric_peer_pending_acks {
     uint32_t range_end;
@@ -754,10 +760,11 @@ struct nvshmemt_libfabric_peer_pending_acks {
     bool has_range;
     uint32_t amo_ack_count;
     uint32_t signal_ack_count; /* Number of record_ack calls (signals/AMOs with submitted_ops+=2) */
+    uint16_t age; /* Progress cycles since last record; used for age-based flushing */
 
     nvshmemt_libfabric_peer_pending_acks() : range_end(0), range_count(0),
                                               has_range(false), amo_ack_count(0),
-                                              signal_ack_count(0) {}
+                                              signal_ack_count(0), age(0) {}
 
     uint32_t total_pending() const { return range_count + amo_ack_count; }
 };
@@ -783,5 +790,8 @@ struct nvshmemt_libfabric_ack_aggregator {
     int flush_peer(int pe, nvshmem_transport_t transport,
                    nvshmemt_libfabric_endpoint_t *ep, fi_addr_t dest_addr);
     int flush_all(nvshmem_transport_t transport, nvshmemt_libfabric_endpoint_t *ep);
+    int flush_stale(nvshmem_transport_t transport, nvshmemt_libfabric_endpoint_t *ep);
+    bool try_extract_for_peer(int pe, uint32_t &range_end, uint32_t &range_count,
+                              uint32_t &signal_ack_count);
 };
 typedef struct nvshmemt_libfabric_ack_aggregator nvshmemt_libfabric_ack_aggregator_t;
