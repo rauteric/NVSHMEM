@@ -501,10 +501,14 @@ int nvshmemt_libfabric_ack_aggregator::flush_peer(
 
     int status;
 
+    flush_count++;
+    uint32_t sig_count = pending.signal_ack_count + pending.amo_ack_count;
+    flush_sig_hist[std::min(sig_count, (uint32_t)63)]++;
+
     status = gdrcopy_amo_ack(transport, *ep, dest_addr,
                              pending.range_end, pending.range_count,
                              pending.amo_ack_count,
-                             pending.signal_ack_count + pending.amo_ack_count, 0);
+                             sig_count, 0);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
                            "Unable to send coalesced ack.\n");
 
@@ -552,6 +556,7 @@ void nvshmemt_libfabric_ack_aggregator::record_ack(
             pending.range_end = seq_num;
         } else {
             /* Non-contiguous: flush current range, start new one */
+            acks_flushed_noncontig += pending.signal_ack_count + pending.amo_ack_count;
             flush_peer(pe, transport, ep, dest_addr);
             pending.range_end = seq_num;
             pending.range_count = preceding_put_count + 1;
@@ -630,6 +635,7 @@ int nvshmemt_libfabric_ack_aggregator::flush_stale(
         pending.age++;
         if (pending.age >= NVSHMEMT_LIBFABRIC_ACK_MAX_AGE) {
             fi_addr_t dest_addr = pe * libfabric_state->eps.size() + ep->ep_index;
+            acks_flushed_stale += pending.signal_ack_count + pending.amo_ack_count;
             status = flush_peer(pe, transport, ep, dest_addr);
             if (status) return status;
             /* flush_peer clears pending; remove from dirty_peers (swap-and-pop) */
@@ -650,6 +656,10 @@ bool nvshmemt_libfabric_ack_aggregator::try_extract_for_peer(
     range_end = pending.range_end;
     range_count = pending.range_count;
     signal_ack_count = pending.signal_ack_count + pending.amo_ack_count;
+
+    acks_piggybacked += signal_ack_count;
+    piggyback_count++;
+    piggyback_sig_hist[std::min(signal_ack_count, (uint32_t)63)]++;
 
     /* Clear pending state */
     pending.range_end = 0;
@@ -2588,6 +2598,48 @@ static int nvshmemt_libfabric_finalize(nvshmem_transport_t transport) {
         libfabric_state->signal_delivery_futex.store(1, std::memory_order_release);
         syscall(SYS_futex, &libfabric_state->signal_delivery_futex, FUTEX_WAKE, 1, NULL, NULL, 0);
         pthread_join(libfabric_state->signal_delivery_thread, NULL);
+
+        /* Print ACK stats for both host and proxy signal states */
+        for (int qp = 0; qp < 2; qp++) {
+            auto *agg = (qp == 0) ? libfabric_state->host_signal_state.ack_aggregator
+                                  : libfabric_state->proxy_signal_state.ack_aggregator;
+            if (!agg) continue;
+            const char *label = (qp == 0) ? "host" : "proxy";
+            uint64_t total_signals = agg->acks_piggybacked + agg->acks_flushed_stale +
+                                     agg->acks_flushed_noncontig;
+            uint64_t total_events = agg->piggyback_count + agg->flush_count;
+            if (total_signals == 0) continue;
+
+            fprintf(stderr,
+                    "\n[ack_stats] pe=%d %s: %lu signals acked via %lu events (%.1fx reduction)\n"
+                    "  piggyback: %lu sigs, %lu events (%.1f avg), %.0f%% of signals\n"
+                    "  stale:     %lu sigs, %.0f%% of signals\n"
+                    "  noncontig: %lu sigs, %.0f%% of signals\n"
+                    "  flush:     %lu events (%.1f avg), flush single-signal rate: %.0f%% (%lu/%lu)\n",
+                    transport->my_pe, label,
+                    total_signals, total_events,
+                    total_events ? (double)total_signals / total_events : 0.0,
+                    agg->acks_piggybacked, agg->piggyback_count,
+                    agg->piggyback_count ? (double)agg->acks_piggybacked / agg->piggyback_count : 0.0,
+                    total_signals ? 100.0 * agg->acks_piggybacked / total_signals : 0.0,
+                    agg->acks_flushed_stale,
+                    total_signals ? 100.0 * agg->acks_flushed_stale / total_signals : 0.0,
+                    agg->acks_flushed_noncontig,
+                    total_signals ? 100.0 * agg->acks_flushed_noncontig / total_signals : 0.0,
+                    agg->flush_count,
+                    agg->flush_count ? (double)(agg->acks_flushed_stale + agg->acks_flushed_noncontig) / agg->flush_count : 0.0,
+                    agg->flush_count ? 100.0 * agg->flush_sig_hist[1] / agg->flush_count : 0.0,
+                    agg->flush_sig_hist[1], agg->flush_count);
+
+            auto print_hist = [&](const char *name, uint64_t *hist) {
+                fprintf(stderr, "  %s:", name);
+                for (int b = 0; b < 64; b++)
+                    if (hist[b]) fprintf(stderr, " %d:%lu", b, hist[b]);
+                fprintf(stderr, "\n");
+            };
+            print_hist("piggyback sig_count", agg->piggyback_sig_hist);
+            print_hist("flush sig_count", agg->flush_sig_hist);
+        }
     }
 
     if (transport->device_pci_paths) {

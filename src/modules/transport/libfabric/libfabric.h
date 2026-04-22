@@ -780,6 +780,17 @@ struct nvshmemt_libfabric_ack_aggregator {
     std::vector<int> dirty_peers;
     uint32_t flush_threshold;
 
+    /* ACK stats */
+    uint64_t acks_piggybacked{0};       /* signals piggybacked on outgoing signals */
+    uint64_t acks_flushed_stale{0};     /* signals flushed by age expiry */
+    uint64_t acks_flushed_noncontig{0}; /* signals flushed by non-contiguous stash */
+    uint64_t flush_count{0};            /* number of fi_send ACKs sent */
+    uint64_t piggyback_count{0};        /* number of piggyback events */
+    uint64_t piggyback_sig_hist[64]{};  /* piggyback signal_count distribution */
+    uint64_t flush_sig_hist[64]{};      /* flush signal_count distribution */
+    uint64_t piggyback_ppc_hist[64]{};  /* piggyback preceding_put_count distribution */
+    uint64_t flush_ppc_hist[64]{};      /* flush preceding_put_count distribution */
+
     nvshmemt_libfabric_ack_aggregator(int npes) : pending_per_peer(npes), flush_threshold(16) {}
 
     void record_ack(int pe, uint32_t seq_num, nvshmem_transport_t transport,
