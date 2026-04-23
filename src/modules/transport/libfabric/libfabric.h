@@ -748,6 +748,8 @@ static_assert(sizeof(nvshmemt_libfabric_gdr_amo_ack_op) <=
               offsetof(nvshmemt_libfabric_gdr_op_ctx_t, ofi_context),
               "Must fit within nvshmemt_libfabric_gdr_op_ctx_t");
 
+#define NVSHMEMT_LIBFABRIC_ACK_MAX_AGE 64
+
 /* Per-peer pending ack state for the ack aggregator */
 struct nvshmemt_libfabric_peer_pending_acks {
     uint32_t range_end;
@@ -755,11 +757,12 @@ struct nvshmemt_libfabric_peer_pending_acks {
     bool has_range;
     uint32_t amo_ack_count;
     uint32_t signal_ack_count; /* Number of record_ack calls (signals/AMOs with submitted_ops+=2) */
+    uint16_t age; /* Progress cycles since last record; used for age-based flushing */
     bool is_dirty; /* Whether this peer is in the dirty_peers vector */
 
     nvshmemt_libfabric_peer_pending_acks() : range_end(0), range_count(0),
                                               has_range(false), amo_ack_count(0),
-                                              signal_ack_count(0),
+                                              signal_ack_count(0), age(0),
                                               is_dirty(false) {}
 
     uint32_t total_pending() const { return range_count + amo_ack_count; }
@@ -786,5 +789,8 @@ struct nvshmemt_libfabric_ack_aggregator {
     int flush_peer(int pe, nvshmem_transport_t transport,
                    nvshmemt_libfabric_endpoint_t *ep, fi_addr_t dest_addr);
     int flush_all(nvshmem_transport_t transport, nvshmemt_libfabric_endpoint_t *ep);
+    int flush_stale(nvshmem_transport_t transport, nvshmemt_libfabric_endpoint_t *ep);
+    bool try_extract_for_peer(int pe, uint32_t &range_end, uint32_t &range_count,
+                              uint32_t &signal_ack_count);
 };
 typedef struct nvshmemt_libfabric_ack_aggregator nvshmemt_libfabric_ack_aggregator_t;
