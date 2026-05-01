@@ -616,8 +616,10 @@ typedef struct {
     std::vector<signal_seq_map> proxy_put_signal_comp_map;
     std::vector<uint32_t> next_expected_seq;
     struct nvshmemt_libfabric_ack_aggregator *ack_aggregator;
-    /* recursive because try_again() -> progress() -> put_signal_completion()
-     * may re-enter on the same thread. */
+    /* Recursive because get_next_seq_num_with_retry (called under this lock
+     * in rma_impl / amo_impl) calls try_again -> progress ->
+     * process_completions -> put_signal_completion -> get_signal_state_locked,
+     * which re-acquires this mutex on the same thread. */
     std::recursive_mutex mtx;
     uint64_t completed_staged_atomics;
 } nvshmemt_libfabric_signal_state_t;
@@ -641,6 +643,53 @@ struct signal_delivery_done_entry {
     uint64_t ret_flags;
     void *ret_addr;
     uint8_t preceding_put_count;
+};
+
+enum nvshmemt_libfabric_deferred_work_type_t {
+    NVSHMEMT_LIBFABRIC_DEFERRED_SIGNAL_WORK,
+    NVSHMEMT_LIBFABRIC_DEFERRED_ACK,
+};
+
+struct nvshmemt_libfabric_deferred_work_t {
+    nvshmemt_libfabric_deferred_work_type_t type;
+    union {
+        signal_delivery_work_entry signal_work;
+        struct {
+            nvshmem_transport_t transport;
+            nvshmemt_libfabric_endpoint_t *ep;
+            fi_addr_t src_addr;
+            uint16_t seq_num;
+            uint8_t range_count;
+            uint8_t ack_num_ops;
+        } ack;
+    };
+    nvshmemt_libfabric_deferred_work_t() : type{}, ack{} {}
+};
+
+class nvshmemt_libfabric_deferred_work_queue_t {
+    std::deque<nvshmemt_libfabric_deferred_work_t> queue;
+    std::atomic_flag lock = ATOMIC_FLAG_INIT;
+
+   public:
+    void push(const nvshmemt_libfabric_deferred_work_t &item) {
+        while (lock.test_and_set(std::memory_order_acquire))
+            NVSHMEMT_LIBFABRIC_CPU_RELAX();
+        queue.push_back(item);
+        lock.clear(std::memory_order_release);
+    }
+
+    bool pop(nvshmemt_libfabric_deferred_work_t &item) {
+        while (lock.test_and_set(std::memory_order_acquire))
+            NVSHMEMT_LIBFABRIC_CPU_RELAX();
+        if (queue.empty()) {
+            lock.clear(std::memory_order_release);
+            return false;
+        }
+        item = queue.front();
+        queue.pop_front();
+        lock.clear(std::memory_order_release);
+        return true;
+    }
 };
 
 template <typename T, int CAPACITY = NVSHMEMT_LIBFABRIC_SIGNAL_QUEUE_CAPACITY>
@@ -730,6 +779,7 @@ typedef struct {
     std::atomic_flag signal_work_queue_lock = ATOMIC_FLAG_INIT;
     SPSCRing<signal_delivery_done_entry> signal_done_queue;
     SPSCRing<signal_delivery_work_entry> signal_work_queue;
+    nvshmemt_libfabric_deferred_work_queue_t *deferred_work_queue;
 } nvshmemt_libfabric_state_t;
 
 typedef struct {
