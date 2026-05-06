@@ -197,13 +197,12 @@ struct host_ep_submit_guard {
                          const nvshmemt_libfabric_endpoint_t &ep)
         : state(s), held(false) {
         if (ep.domain_index < state->num_host_domains) {
-            while (state->host_ep_progress_lock.test_and_set(std::memory_order_acquire))
-                NVSHMEMT_LIBFABRIC_CPU_RELAX();
+            state->host_ep_progress_lock.lock();
             held = true;
         }
     }
     ~host_ep_submit_guard() {
-        if (held) state->host_ep_progress_lock.clear(std::memory_order_release);
+        if (held) state->host_ep_progress_lock.unlock();
     }
     host_ep_submit_guard(const host_ep_submit_guard&) = delete;
     host_ep_submit_guard& operator=(const host_ep_submit_guard&) = delete;
@@ -906,9 +905,8 @@ static int nvshmemt_libfabric_process_completion(nvshmem_transport_t transport, 
 static inline int progress_host_eps(nvshmem_transport_t transport, bool blocking) {
     nvshmemt_libfabric_state_t *state = (nvshmemt_libfabric_state_t *)transport->state;
     if (blocking) {
-        while (state->host_ep_progress_lock.test_and_set(std::memory_order_acquire))
-            NVSHMEMT_LIBFABRIC_CPU_RELAX();
-    } else if (state->host_ep_progress_lock.test_and_set(std::memory_order_acquire)) {
+        state->host_ep_progress_lock.lock();
+    } else if (!state->host_ep_progress_lock.try_lock()) {
         return 0; /* user thread is draining; skip */
     }
     int status = 0;
@@ -916,7 +914,7 @@ static inline int progress_host_eps(nvshmem_transport_t transport, bool blocking
         status = nvshmemt_libfabric_process_completion(transport, i);
         if (unlikely(status)) break;
     }
-    state->host_ep_progress_lock.clear(std::memory_order_release);
+    state->host_ep_progress_lock.unlock();
     return status;
 }
 
