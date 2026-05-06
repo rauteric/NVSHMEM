@@ -189,7 +189,11 @@ get_signal_state_locked(nvshmemt_libfabric_state_t *state,
 
 /* FI_THREAD_COMPLETION: user-thread submissions on host EP (eps[0..num_host_domains])
  * must be serialized with the proxy thread's fi_cq_read on the same CQ.
- * This guard acquires host_ep_progress_lock blockingly iff ep is a host EP. */
+ * This guard acquires host_ep_progress_lock blockingly iff ep is a host EP.
+ *
+ * host_ep_progress_lock is a non-recursive atomic_flag spinlock. Callers must
+ * not nest acquisitions on the same thread; all known call paths have been
+ * structured so re-entry does not occur. */
 struct host_ep_submit_guard {
     nvshmemt_libfabric_state_t *state;
     bool held;
@@ -197,12 +201,13 @@ struct host_ep_submit_guard {
                          const nvshmemt_libfabric_endpoint_t &ep)
         : state(s), held(false) {
         if (ep.domain_index < state->num_host_domains) {
-            state->host_ep_progress_lock.lock();
+            while (state->host_ep_progress_lock.test_and_set(std::memory_order_acquire))
+                NVSHMEMT_LIBFABRIC_CPU_RELAX();
             held = true;
         }
     }
     ~host_ep_submit_guard() {
-        if (held) state->host_ep_progress_lock.unlock();
+        if (held) state->host_ep_progress_lock.clear(std::memory_order_release);
     }
     host_ep_submit_guard(const host_ep_submit_guard&) = delete;
     host_ep_submit_guard& operator=(const host_ep_submit_guard&) = delete;
@@ -913,7 +918,7 @@ static inline int progress_host_eps(nvshmem_transport_t transport, bool blocking
     /* If blocking == true, caller is assumed to hold the progress lock.
        If blocking == false, attempt to take the lock here. */
     if (!blocking) {
-        if (!state->host_ep_progress_lock.try_lock()) {
+        if (state->host_ep_progress_lock.test_and_set(std::memory_order_acquire)) {
             return 0; /* user thread is draining; skip */
         }
         acquired_here = true;
@@ -924,7 +929,7 @@ static inline int progress_host_eps(nvshmem_transport_t transport, bool blocking
         status = nvshmemt_libfabric_process_completion(transport, i);
         if (unlikely(status)) break;
     }
-    if (acquired_here) state->host_ep_progress_lock.unlock();
+    if (acquired_here) state->host_ep_progress_lock.clear(std::memory_order_release);
     return status;
 }
 
