@@ -294,6 +294,7 @@ int gdrcopy_amo_ack(nvshmem_transport_t transport, nvshmemt_libfabric_endpoint_t
     nvshmemt_libfabric_gdr_amo_ack_op_t *ack_op;
     uint64_t num_retries = 0;
     int status;
+    host_ep_submit_guard _host_guard(libfabric_state, ep);
 
     do {
         status = libfabric_state->op_queue[ep.domain_index]->getNextSends(&send_elem, 1);
@@ -441,6 +442,7 @@ static int nvshmemt_libfabric_gdr_complete_amos(nvshmem_transport_t transport) {
     }
 
     nvshmemt_libfabric_endpoint_t &ep = *(libfabric_state->eps[done.ep_index]);
+    host_ep_submit_guard _host_guard(libfabric_state, ep);
 
     /* Post recv before posting TX operations to avoid deadlocks */
     status = fi_recv(ep.endpoint, (void *)done.op, NVSHMEM_STAGED_AMO_WIREDATA_SIZE,
@@ -1675,6 +1677,7 @@ static int nvshmemt_libfabric_amo(struct nvshmem_transport *transport, int pe, v
 
     ep_idx = get_next_ep(libfabric_state, qp_index);
     nvshmemt_libfabric_endpoint_t &ep = *(libfabric_state->eps[ep_idx]);
+    host_ep_submit_guard _host_guard(libfabric_state, ep);
     domain_idx = ep.domain_index;
     target_ep = pe * libfabric_state->eps.size() + ep_idx;
 
