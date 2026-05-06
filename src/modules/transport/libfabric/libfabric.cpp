@@ -1294,12 +1294,18 @@ static int nvshmemt_libfabric_quiet(struct nvshmem_transport *tcurr, int /*pe*/,
 
         uint64_t total_submitted = 0;
         uint64_t total_completed = 0;
-        for (int i = ep_start_idx; i < ep_end_idx; i++) {
-            total_submitted += libfabric_state->eps[i]->submitted_ops;
-            total_completed += libfabric_state->eps[i]->completed_ops;
+        {
+            /* The proxy thread may modify host EP counters via drain_deferred_work
+             * (gdrcopy_amo_ack -> submitted_ops++) while holding host_ep_progress_lock.
+             * Take the same lock to get a consistent snapshot. */
+            host_ep_submit_guard _quiet_guard(libfabric_state,
+                                              *libfabric_state->eps[ep_start_idx]);
+            for (int i = ep_start_idx; i < ep_end_idx; i++) {
+                total_submitted += libfabric_state->eps[i]->submitted_ops;
+                total_completed += libfabric_state->eps[i]->completed_ops;
+            }
+            total_completed += signal_state.completed_staged_atomics;
         }
-
-        total_completed += signal_state.completed_staged_atomics;
         if (total_submitted == total_completed) {
             break;
         }
