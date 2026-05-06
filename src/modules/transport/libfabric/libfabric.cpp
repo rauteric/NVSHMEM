@@ -902,22 +902,29 @@ static int nvshmemt_libfabric_process_completion(nvshmem_transport_t transport, 
  * Safe for try_again paths that cannot re-enter the top-level progress loop.
  */
 /* Drain host EP CQs under host_ep_progress_lock. User-thread path (blocking=true)
- * acquires the lock; proxy path (blocking=false) try-locks and skips if the
- * user thread is already draining (they will make progress on their own).
- * Essence of upstream commit 756f773. */
+ * requires the caller to already hold host_ep_progress_lock (via
+ * host_ep_submit_guard at the data-path entry point or quiet's outer guard).
+ * Proxy path (blocking=false) try-locks and skips if the user thread is
+ * already draining (they will make progress on their own). */
 static inline int progress_host_eps(nvshmem_transport_t transport, bool blocking) {
     nvshmemt_libfabric_state_t *state = (nvshmemt_libfabric_state_t *)transport->state;
-    if (blocking) {
-        state->host_ep_progress_lock.lock();
-    } else if (!state->host_ep_progress_lock.try_lock()) {
-        return 0; /* user thread is draining; skip */
+    bool acquired_here = false;
+
+    /* If blocking == true, caller is assumed to hold the progress lock.
+       If blocking == false, attempt to take the lock here. */
+    if (!blocking) {
+        if (!state->host_ep_progress_lock.try_lock()) {
+            return 0; /* user thread is draining; skip */
+        }
+        acquired_here = true;
     }
+
     int status = 0;
     for (int i = 0; i < state->num_host_domains; i++) {
         status = nvshmemt_libfabric_process_completion(transport, i);
         if (unlikely(status)) break;
     }
-    state->host_ep_progress_lock.unlock();
+    if (acquired_here) state->host_ep_progress_lock.unlock();
     return status;
 }
 
