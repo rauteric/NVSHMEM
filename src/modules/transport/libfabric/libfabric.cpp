@@ -294,7 +294,8 @@ int gdrcopy_amo_ack(nvshmem_transport_t transport, nvshmemt_libfabric_endpoint_t
     nvshmemt_libfabric_gdr_amo_ack_op_t *ack_op;
     uint64_t num_retries = 0;
     int status;
-    host_ep_submit_guard _host_guard(libfabric_state, ep);
+
+    /* Caller must hold host_ep_progress_lock for host EPs (via host_ep_submit_guard). */
 
     do {
         status = libfabric_state->op_queue[ep.domain_index]->getNextSends(&send_elem, 1);
@@ -1000,6 +1001,8 @@ static int nvshmemt_libfabric_drain_deferred_work(nvshmem_transport_t transport)
         if (item.type == NVSHMEMT_LIBFABRIC_DEFERRED_SIGNAL_WORK) {
             status = nvshmemt_libfabric_enqueue_signal_work(transport, item.signal_work);
         } else {
+            /* gdrcopy_amo_ack requires host_ep_progress_lock held for host EPs. */
+            host_ep_submit_guard _host_guard(libfabric_state, *item.ack.ep);
             status = gdrcopy_amo_ack(transport, *item.ack.ep, item.ack.src_addr,
                                      item.ack.ack_payload.ack_seq_num,
                                      item.ack.ack_payload.ack_count,
