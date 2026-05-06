@@ -1569,6 +1569,7 @@ static int nvshmemt_libfabric_rma(struct nvshmem_transport *tcurr, int pe, rma_v
     nvshmemt_libfabric_endpoint_t &ep = *(libfabric_state->eps[ep_idx]);
 
     // Generate sequence number for P and PUT operations when ordering is needed
+    host_ep_submit_guard _host_guard(libfabric_state, ep);
     if (libfabric_state->use_staged_atomics &&
         (verb.desc == NVSHMEMI_OP_P || verb.desc == NVSHMEMI_OP_PUT)) {
 
@@ -1602,7 +1603,6 @@ static int nvshmemt_libfabric_rma(struct nvshmem_transport *tcurr, int pe, rma_v
         imm_data = &imm_data_val;
     }
 
-    host_ep_submit_guard _host_guard(libfabric_state, ep);
     return nvshmemt_libfabric_rma_impl(tcurr, pe, verb, remote, local, bytesdesc, qp_index, imm_data, ep);
 }
 
@@ -1677,13 +1677,13 @@ static int nvshmemt_libfabric_gdr_amo(struct nvshmem_transport *transport, int p
                         fi_mr_desc(libfabric_state->mrs[domain_idx]), target_ep, &amo->ofi_context);
         } while (try_again(transport, &status, &num_retries,
                            NVSHMEMT_LIBFABRIC_TRY_AGAIN_CALL_SITE_GDR_AMO_SEND, qp_index, progress_type::All));
-    }
 
-    if (status) {
-        NVSHMEMI_ERROR_PRINT("Received an error when trying to post an AMO operation.\n");
-        status = NVSHMEMX_ERROR_INTERNAL;
-    } else {
-        ep.submitted_ops += 2;
+        if (status) {
+            NVSHMEMI_ERROR_PRINT("Received an error when trying to post an AMO operation.\n");
+            status = NVSHMEMX_ERROR_INTERNAL;
+        } else {
+            ep.submitted_ops += 2;
+        }
     }
 
 out:
