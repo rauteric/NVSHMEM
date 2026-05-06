@@ -1309,26 +1309,33 @@ static int nvshmemt_libfabric_quiet(struct nvshmem_transport *tcurr, int /*pe*/,
         ep_end_idx = libfabric_state->eps.size();
     }
 
-    const nvshmemt_libfabric_signal_state_t &signal_state =
-        (qp_index == NVSHMEMX_QP_HOST) ? libfabric_state->host_signal_state
-                                       : libfabric_state->proxy_signal_state;
-
     for (;;) {
-        /* Force-flush all pending ACKs so they get sent before checking quiescence */
-        if (signal_state.ack_aggregator) {
-            int ep_idx = (qp_index == NVSHMEMX_QP_HOST) ? 0 : libfabric_state->num_host_domains;
-            status = signal_state.ack_aggregator->flush_all(tcurr, *libfabric_state->eps[ep_idx]);
-            if (unlikely(status)) break;
-        }
-
         uint64_t total_submitted = 0;
         uint64_t total_completed = 0;
         {
-            /* The proxy thread may modify host EP counters via drain_deferred_work
-             * (gdrcopy_amo_ack -> submitted_ops++) while holding host_ep_progress_lock.
-             * Take the same lock to get a consistent snapshot. */
-            host_ep_submit_guard _quiet_guard(libfabric_state,
-                                              *libfabric_state->eps[ep_start_idx]);
+            /* Lock order: host_ep_progress_lock -> signal_state.mtx, matching
+             * gdr_complete_amos and user-thread paths. host_ep_submit_guard also
+             * gives a consistent snapshot of submitted_ops/completed_ops, since
+             * the proxy thread may mutate them via drain_deferred_work ->
+             * gdrcopy_amo_ack while holding host_ep_progress_lock. */
+            host_ep_submit_guard _host_guard(libfabric_state,
+                                             *libfabric_state->eps[ep_start_idx]);
+            auto [signal_state_p, _sig_lk] =
+                get_signal_state_locked(libfabric_state, *libfabric_state->eps[ep_start_idx]);
+            const nvshmemt_libfabric_signal_state_t &signal_state = *signal_state_p;
+
+            /* Force-flush all pending ACKs so they get sent before checking quiescence.
+             * flush_peer -> gdrcopy_amo_ack re-acquires host_ep_progress_lock
+             * recursively. */
+            if (signal_state.ack_aggregator) {
+                int ep_idx = (qp_index == NVSHMEMX_QP_HOST)
+                                 ? 0
+                                 : libfabric_state->num_host_domains;
+                status = signal_state.ack_aggregator->flush_all(
+                    tcurr, *libfabric_state->eps[ep_idx]);
+                if (unlikely(status)) break;
+            }
+
             for (int i = ep_start_idx; i < ep_end_idx; i++) {
                 total_submitted += libfabric_state->eps[i]->submitted_ops;
                 total_completed += libfabric_state->eps[i]->completed_ops;
