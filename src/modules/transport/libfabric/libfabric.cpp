@@ -1020,11 +1020,20 @@ static int nvshmemt_libfabric_progress(nvshmem_transport_t transport, int qp_ind
     int status = drain_completions(transport, qp_index);
     if (unlikely(status)) return status;
 
+    /* Post-drain work (deferred ACKs, AMO processing, aggregator flushing) is done
+     * only by the proxy thread. The shared deferred_work_queue and signal_done_queue
+     * can contain items targeting any EP, and the host thread must not touch proxy
+     * EPs (FI_THREAD_COMPLETION). Host-EP touches from the proxy thread are
+     * serialized via host_ep_submit_guard. */
+    if (qp_index == NVSHMEMX_QP_HOST) return 0;
+
     status = nvshmemt_libfabric_drain_deferred_work(transport);
     if (unlikely(status)) return status;
 
     if (libfabric_state->provider == NVSHMEMT_LIBFABRIC_PROVIDER_EFA) {
-        int effective_qp = libfabric_state->use_auto_progress ? qp_index : NVSHMEMX_QP_ALL;
+        /* Proxy thread handles both host and proxy domains since host thread no
+         * longer does post-drain work. */
+        int effective_qp = NVSHMEMX_QP_ALL;
         /* Serialize access to SPSC rings; both host and proxy threads may enter here. */
         while (libfabric_state->signal_progress_lock.test_and_set(std::memory_order_acquire)) {
             NVSHMEMT_LIBFABRIC_CPU_RELAX();
@@ -1044,26 +1053,33 @@ static int nvshmemt_libfabric_progress(nvshmem_transport_t transport, int qp_ind
             return NVSHMEMX_ERROR_INTERNAL;
         }
 
-        /* Flush stale coalesced acks */
-        if (effective_qp == NVSHMEMX_QP_HOST || effective_qp == NVSHMEMX_QP_ALL) {
-            if (libfabric_state->host_signal_state.ack_aggregator) {
-                status = libfabric_state->host_signal_state.ack_aggregator->flush_stale(
-                    transport, *libfabric_state->eps[0]);
-                if (status) {
-                    libfabric_state->signal_progress_lock.clear(std::memory_order_release);
-                    return NVSHMEMX_ERROR_INTERNAL;
-                }
+        /* Flush stale coalesced acks for both host and proxy aggregators.
+         * Host aggregator is also accessed concurrently by user threads (via
+         * try_extract_for_peer from gdr_signal), so lock host_signal_state.mtx
+         * through get_signal_state_locked. Proxy signal_state is proxy-thread-
+         * local, so its aggregator needs no additional lock.
+         *
+         * Lock order must be host_ep_progress_lock -> signal_state.mtx to match
+         * gdr_complete_amos/process_completion and user-thread paths. flush_peer
+         * -> gdrcopy_amo_ack re-acquires host_ep_progress_lock recursively. */
+        if (libfabric_state->host_signal_state.ack_aggregator) {
+            host_ep_submit_guard _host_guard(libfabric_state, *libfabric_state->eps[0]);
+            auto [_sig, _sig_lk] =
+                get_signal_state_locked(libfabric_state, *libfabric_state->eps[0]);
+            status = libfabric_state->host_signal_state.ack_aggregator->flush_stale(
+                transport, *libfabric_state->eps[0]);
+            if (status) {
+                libfabric_state->signal_progress_lock.clear(std::memory_order_release);
+                return NVSHMEMX_ERROR_INTERNAL;
             }
         }
 
-        if (effective_qp != NVSHMEMX_QP_HOST) {
-            if (libfabric_state->proxy_signal_state.ack_aggregator) {
-                status = libfabric_state->proxy_signal_state.ack_aggregator->flush_stale(
-                    transport, *libfabric_state->eps[libfabric_state->num_host_domains]);
-                if (status) {
-                    libfabric_state->signal_progress_lock.clear(std::memory_order_release);
-                    return NVSHMEMX_ERROR_INTERNAL;
-                }
+        if (libfabric_state->proxy_signal_state.ack_aggregator) {
+            status = libfabric_state->proxy_signal_state.ack_aggregator->flush_stale(
+                transport, *libfabric_state->eps[libfabric_state->num_host_domains]);
+            if (status) {
+                libfabric_state->signal_progress_lock.clear(std::memory_order_release);
+                return NVSHMEMX_ERROR_INTERNAL;
             }
         }
 
@@ -1626,6 +1642,7 @@ static int nvshmemt_libfabric_gdr_amo(struct nvshmem_transport *transport, int p
 
     /* Signal-only operations use gdr_signal path with num_writes=0 */
     if (is_signal_only_op(verb.desc)) {
+        host_ep_submit_guard _host_guard(libfabric_state, ep);
         auto [signal_state, _sig_lk] = get_signal_state_locked(libfabric_state, ep);
         auto &seq_counter = signal_state->put_signal_seq_counter[pe];
         uint32_t sequence_count = 0;
@@ -1638,11 +1655,9 @@ static int nvshmemt_libfabric_gdr_amo(struct nvshmem_transport *transport, int p
         uint8_t ppc = seq_counter.put_count;
         seq_counter.put_count = 0;
 
-        {
-            host_ep_submit_guard _host_guard(libfabric_state, ep);
-            status = nvshmemt_libfabric_gdr_signal(transport, pe, curetptr, verb, remote,
-                                                   bytesdesc, qp_index, sequence_count, 0, ep, ppc);
-        }
+        status = nvshmemt_libfabric_gdr_signal(transport, pe, curetptr, verb, remote,
+                                               bytesdesc, qp_index, sequence_count, 0, ep, ppc);
+
         goto out;
     }
 
