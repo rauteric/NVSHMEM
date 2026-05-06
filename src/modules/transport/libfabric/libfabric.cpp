@@ -245,8 +245,8 @@ int try_again(nvshmem_transport_t transport, int *status, uint64_t *num_retries,
         }
         (*num_retries)++;
         /*
-         * CompletionsOnly is used by retries originating from paths that must not
-         * re-enter top-level progress while signal_progress_lock is held.
+         * CompletionsOnly is used by retries originating from paths inside the
+         * post-drain progress block to avoid re-entering top-level progress.
          */
         if (prog_type == progress_type::All) {
             *status = nvshmemt_libfabric_progress(transport, qp_index);
@@ -1034,24 +1034,14 @@ static int nvshmemt_libfabric_progress(nvshmem_transport_t transport, int qp_ind
         /* Proxy thread handles both host and proxy domains since host thread no
          * longer does post-drain work. */
         int effective_qp = NVSHMEMX_QP_ALL;
-        /* Serialize access to SPSC rings; both host and proxy threads may enter here. */
-        while (libfabric_state->signal_progress_lock.test_and_set(std::memory_order_acquire)) {
-            NVSHMEMT_LIBFABRIC_CPU_RELAX();
-        }
 
         /* Drain done_queue first: fi_recv + ACK, freeing space before new work. */
         status = nvshmemt_libfabric_gdr_complete_amos(transport);
-        if (unlikely(status)) {
-            libfabric_state->signal_progress_lock.clear(std::memory_order_release);
-            return NVSHMEMX_ERROR_INTERNAL;
-        }
+        if (unlikely(status)) return NVSHMEMX_ERROR_INTERNAL;
 
         /* Dequeue from op_queue, push to work_queue for signal delivery thread */
         status = nvshmemt_libfabric_gdr_process_amos(transport, effective_qp);
-        if (unlikely(status)) {
-            libfabric_state->signal_progress_lock.clear(std::memory_order_release);
-            return NVSHMEMX_ERROR_INTERNAL;
-        }
+        if (unlikely(status)) return NVSHMEMX_ERROR_INTERNAL;
 
         /* Flush stale coalesced acks for both host and proxy aggregators.
          * Host aggregator is also accessed concurrently by user threads (via
@@ -1068,22 +1058,14 @@ static int nvshmemt_libfabric_progress(nvshmem_transport_t transport, int qp_ind
                 get_signal_state_locked(libfabric_state, *libfabric_state->eps[0]);
             status = libfabric_state->host_signal_state.ack_aggregator->flush_stale(
                 transport, *libfabric_state->eps[0]);
-            if (status) {
-                libfabric_state->signal_progress_lock.clear(std::memory_order_release);
-                return NVSHMEMX_ERROR_INTERNAL;
-            }
+            if (status) return NVSHMEMX_ERROR_INTERNAL;
         }
 
         if (libfabric_state->proxy_signal_state.ack_aggregator) {
             status = libfabric_state->proxy_signal_state.ack_aggregator->flush_stale(
                 transport, *libfabric_state->eps[libfabric_state->num_host_domains]);
-            if (status) {
-                libfabric_state->signal_progress_lock.clear(std::memory_order_release);
-                return NVSHMEMX_ERROR_INTERNAL;
-            }
+            if (status) return NVSHMEMX_ERROR_INTERNAL;
         }
-
-        libfabric_state->signal_progress_lock.clear(std::memory_order_release);
 
         nvshmemt_libfabric_wake_signal_delivery_thread(libfabric_state);
     }
